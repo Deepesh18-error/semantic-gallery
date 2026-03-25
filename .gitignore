@@ -1,0 +1,39 @@
+# --- 1. THE VAULT (SECURITY) ---
+# NEVER push these. They contain your API keys and passwords.
+.env
+check_env.py
+test_gemini.py
+test_ai.py
+
+# --- 2. THE BUBBLE (ENVIRONMENTS) ---
+# Everyone should create their own virtual environment. 
+# Sending yours will make the project too large and won't work on other PCs.
+venv/
+ENV/
+env/
+
+# --- 3. THE TRASH (PYTHON CACHES) ---
+# These are "junk" files Python creates to run faster. 
+# They are different for every computer.
+__pycache__/
+*.py[cod]
+*$py.class
+
+# --- 4. LOCAL DATA (DATABASES & UPLOADS) ---
+# We don't want to upload your personal "Burger Photos" to GitHub!
+# We also don't want to upload your local SQLite database.
+db.sqlite3
+media/
+uploads/
+storage/
+
+# --- 5. FRONTEND & ELECTRON (FUTURE PROOFING) ---
+# These folders get huge. We only want the code, not the "Tools".
+node_modules/
+dist/
+build/
+*.log
+
+# --- 6. OPERATING SYSTEM TRASH ---
+.DS_Store
+Thumbs.db
