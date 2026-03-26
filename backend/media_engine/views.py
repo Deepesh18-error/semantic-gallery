@@ -3,6 +3,7 @@ from rest_framework.response import Response
 from rest_framework import status
 from rest_framework.parsers import MultiPartParser, FormParser
 from rest_framework.decorators import parser_classes
+import mimetypes
 from django.conf import settings
 import os
 import uuid
@@ -183,3 +184,59 @@ def upload_media(request):
         "media_id": media_id,
         "status": "PENDING"
     }, status=201)
+    
+    
+    
+    
+# --- 1. THE STREAMER (View File) ---
+@api_view(['GET'])
+@token_required
+def serve_media_file(request, media_id):
+    # 1. Find the metadata in MongoDB
+    media_item = db.media_items.find_one({"_id": media_id, "user_id": request.user_id})
+    
+    if not media_item:
+        return Response({"error": "File not found or access denied"}, status=404)
+
+    file_path = media_item['file_path']
+
+    # 2. Check if the file actually exists on the hard drive
+    if not os.path.exists(file_path):
+        return Response({"error": "Physical file missing from vault"}, status=404)
+
+    # 3. Detect the "Flavor" (MIME type) of the file (e.g., image/jpeg)
+    content_type, _ = mimetypes.guess_type(file_path)
+    
+    # 4. Stream the bytes to the browser
+    # Intuition: This opens a "Live Pipe" between the vault and the user's screen
+    response = FileResponse(open(file_path, 'rb'), content_type=content_type)
+    return response
+
+
+# --- 2. THE ERASER (Delete File) ---
+@api_view(['DELETE'])
+@token_required
+def delete_media_item(request, media_id):
+    # 1. Find the file first to get the path
+    media_item = db.media_items.find_one({"_id": media_id, "user_id": request.user_id})
+    
+    if not media_item:
+        return Response({"error": "File not found or access denied"}, status=404)
+
+    file_path = media_item['file_path']
+
+    # 2. DELETE FROM HARD DRIVE (The Physical Part)
+    try:
+        if os.path.exists(file_path):
+            os.remove(file_path)
+            print(f"🗑️ Physically deleted: {file_path}")
+    except Exception as e:
+        # We log the error but continue to delete the DB record
+        print(f"⚠️ Error deleting physical file: {e}")
+
+    # 3. DELETE FROM MONGODB (The Metadata Part)
+    db.media_items.delete_one({"_id": media_id})
+
+    # Note: In Phase 4, we will add Step 4: Delete from Pinecone here!
+
+    return Response({"message": "File and metadata deleted successfully"}, status=200)
