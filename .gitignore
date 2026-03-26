@@ -37,3 +37,6 @@ build/
 # --- 6. OPERATING SYSTEM TRASH ---
 .DS_Store
 Thumbs.db
+
+generate_code_snapshot.py
+all_code_snapshot.txt
