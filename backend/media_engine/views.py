@@ -4,7 +4,7 @@ from rest_framework import status
 import uuid
 from datetime import datetime
 from .database import db
-from .auth_service import hash_password, verify_password, create_token
+from .auth_service import hash_password, verify_password, create_token , token_required
 
 
 
@@ -66,3 +66,47 @@ def login_user(request):
     else:
         return Response({"error": "Invalid email or password"}, status=status.HTTP_401_BAD_UNAUTHORIZED)
 
+
+
+# --- CREATE COLLECTION ---
+@api_view(['POST'])
+@token_required # The bouncer checks the token before this code runs
+def create_collection(request):
+    data = request.data
+    name = data.get('name')
+    description = data.get('description', "")
+    theme_color = data.get('theme_color', "#3498db") # Default blue
+    icon_tag = data.get('icon_tag', "folder")
+
+    if not name:
+        return Response({"error": "Collection name is required"}, status=status.HTTP_400_BAD_REQUEST)
+
+    # Create the document for MongoDB
+    collection_id = str(uuid.uuid4())
+    new_collection = {
+        "_id": collection_id,
+        "user_id": request.user_id, # This comes from the decoded token!
+        "name": name,
+        "description": description,
+        "theme_color": theme_color,
+        "icon_tag": icon_tag,
+        "created_at": datetime.utcnow()
+    }
+
+    db.collections.insert_one(new_collection)
+
+    return Response({
+        "message": "Collection created!",
+        "collection": new_collection
+    }, status=status.HTTP_201_CREATED)
+
+
+# --- LIST MY COLLECTIONS ---
+@api_view(['GET'])
+@token_required
+def list_collections(request):
+    # Search MongoDB for collections where user_id matches the logged-in user
+    # Intuition: "Show me only MY lockers, not everyone's."
+    user_collections = list(db.collections.find({"user_id": request.user_id}))
+    
+    return Response(user_collections)

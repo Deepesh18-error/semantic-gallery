@@ -4,6 +4,10 @@ import datetime
 import os
 import uuid
 from .database import db
+from functools import wraps
+from rest_framework.response import Response
+from rest_framework import status
+
 
 
 # 1. Password Scrambler (Hashing)
@@ -30,3 +34,31 @@ def create_token(user_id):
     # Sign the token with our Secret Key from .env
     token = jwt.encode(payload, os.getenv("JWT_SECRET"), algorithm="HS256")
     return token
+
+
+
+# --- THE SECURITY GUARD ---
+def token_required(f):
+    @wraps(f)
+    def decorated(request, *args, **kwargs):
+        token = None
+        # 1. Look for the "Authorization" header
+        if 'Authorization' in request.headers:
+            # Header looks like "Bearer <token>", so we split and take the 2nd part
+            auth_header = request.headers['Authorization'].split(" ")
+            if len(auth_header) == 2:
+                token = auth_header[1]
+
+        if not token:
+            return Response({'error': 'Token is missing! Please login.'}, status=status.HTTP_401_UNAUTHORIZED)
+
+        try:
+            # 2. Try to decode the wristband
+            data = jwt.decode(token, os.getenv("JWT_SECRET"), algorithms=["HS256"])
+            # 3. Attach the user_id to the request so the View can use it
+            request.user_id = data['user_id']
+        except Exception as e:
+            return Response({'error': 'Token is invalid or expired!'}, status=status.HTTP_401_UNAUTHORIZED)
+
+        return f(request, *args, **kwargs)
+    return decorated
