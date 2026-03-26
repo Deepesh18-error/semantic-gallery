@@ -130,3 +130,5 @@ CORS_ALLOWED_ORIGINS = [
 
 # This allows us to send files (images/videos) in requests
 CORS_ALLOW_CREDENTIALS = True
+
+MEDIA_VAULT = BASE_DIR / 'media_vault'

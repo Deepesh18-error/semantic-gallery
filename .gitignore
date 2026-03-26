@@ -40,3 +40,5 @@ Thumbs.db
 
 generate_code_snapshot.py
 all_code_snapshot.txt
+
+backend/media_vault/

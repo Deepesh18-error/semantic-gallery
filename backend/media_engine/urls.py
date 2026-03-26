@@ -3,7 +3,8 @@ from .views import (
     register_user, 
     login_user, 
     create_collection, 
-    list_collections
+    list_collections,
+    upload_media
 )
 
 urlpatterns = [
@@ -11,4 +12,6 @@ urlpatterns = [
     path('login/', login_user, name='login'),
     path('collections/', list_collections, name='list_collections'),
     path('collections/create/', create_collection, name='create_collection'),
+    path('media/upload/', upload_media, name='upload_media'),
+    
 ]

@@ -1,11 +1,15 @@
 from rest_framework.decorators import api_view
 from rest_framework.response import Response
 from rest_framework import status
+from rest_framework.parsers import MultiPartParser, FormParser
+from rest_framework.decorators import parser_classes
+from django.conf import settings
+import os
 import uuid
 from datetime import datetime
 from .database import db
 from .auth_service import hash_password, verify_password, create_token , token_required
-
+from .utils import validate_file
 
 
 @api_view(['POST'])
@@ -110,3 +114,72 @@ def list_collections(request):
     user_collections = list(db.collections.find({"user_id": request.user_id}))
     
     return Response(user_collections)
+
+
+
+@api_view(['POST'])
+@parser_classes([MultiPartParser, FormParser])
+@token_required
+def upload_media(request):
+    # 1. Get data from the "Multipart" form
+    file_obj = request.FILES.get('file')
+    collection_id = request.data.get('collection_id')
+
+    print(f"DEBUG: File arrived -> {file_obj}")
+    print(f"DEBUG: Collection ID arrived -> {collection_id}")
+    
+    if not file_obj or not collection_id:
+        return Response({"error": "File and collection_id are required"}, status=400)
+
+    # 2. Verify collection belongs to this user
+    collection = db.collections.find_one({"_id": collection_id, "user_id": request.user_id})
+    if not collection:
+        return Response({"error": "Collection not found or access denied"}, status=404)
+
+    # 3. Validate File (The Bouncer)
+    is_valid, message, media_type = validate_file(file_obj)
+    if not is_valid:
+        return Response({"error": message}, status=400)
+
+    # 4. Storage Logic (The Vault)
+    # Create unique name: a1b2-c3d4.jpg
+    file_ext = os.path.splitext(file_obj.name)[1].lower()
+    media_id = str(uuid.uuid4())
+    stored_name = f"{media_id}{file_ext}"
+
+    # Target path: media_vault / user_id / collection_id / filename
+    upload_dir = os.path.join(settings.MEDIA_VAULT, request.user_id, collection_id)
+    os.makedirs(upload_dir, exist_ok=True) # Create folders if they don't exist
+    
+    file_path = os.path.join(upload_dir, stored_name)
+
+    # Write the actual bytes to the hard drive
+    with open(file_path, 'wb+') as destination:
+        for chunk in file_obj.chunks():
+            destination.write(chunk)
+
+    # 5. Record in MongoDB (The Catalog Card)
+    media_doc = {
+        "_id": media_id,
+        "user_id": request.user_id,
+        "collection_id": collection_id,
+        "media_type": media_type,
+        "file_path": file_path, # The address on disk
+        "file_metadata": {
+            "original_name": file_obj.name,
+            "stored_name": stored_name,
+            "mime_type": file_obj.content_type,
+            "size_bytes": file_obj.size
+        },
+        "processing_status": "PENDING", # For Phase 3 AI
+        "ai_data": {"description": None, "tags": []},
+        "created_at": datetime.utcnow()
+    }
+
+    db.media_items.insert_one(media_doc)
+
+    return Response({
+        "message": "File uploaded and stored in vault!",
+        "media_id": media_id,
+        "status": "PENDING"
+    }, status=201)
