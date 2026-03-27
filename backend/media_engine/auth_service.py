@@ -21,6 +21,9 @@ def hash_password(password):
 
 # 2. Scramble Checker (Verification)
 def verify_password(plain_password, hashed_password):
+    print("\n--- 🔐 BCRYPT CHECK ---")
+    print(f"Plain Password Type: {type(plain_password)}")
+    print(f"Hashed Password from DB: {hashed_password[:10]}...")
     return bcrypt.checkpw(plain_password.encode('utf-8'), hashed_password.encode('utf-8'))
 
 

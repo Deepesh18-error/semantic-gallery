@@ -47,18 +47,20 @@ def register_user(request):
 @api_view(['POST'])
 def login_user(request):
     data = request.data
-    email = data.get('email')
-    password = data.get('password')
+    email = data.get('email', '').strip().lower()
+    password = data.get('password', '')
 
-
-    # 1. Find the user in the database
+    print("\n--- 📥 BACKEND: LOGIN ATTEMPT ---")
     user = db.users.find_one({"email": email})
 
-        # 2. Check if user exists AND password is correct
     if user and verify_password(password, user['password_hash']):
-        # 3. Create the Digital Wristband
+        print("✅ AUTH SUCCESS: Password matched!")
+        
+        # 1. Create the Token
         token = create_token(user['_id'])
         
+        # 2. YOU MUST RETURN THIS RESPONSE! 
+        # (This was likely missing or indented wrong in your file)
         return Response({
             "message": "Login Successful",
             "token": token,
@@ -67,10 +69,13 @@ def login_user(request):
                 "email": user['email'],
                 "id": user['_id']
             }
-        })
+        }, status=status.HTTP_200_OK)
+    
     else:
-        return Response({"error": "Invalid email or password"}, status=status.HTTP_401_BAD_UNAUTHORIZED)
-
+        print("❌ AUTH ERROR: Invalid credentials")
+        return Response({
+            "error": "Invalid email or password"
+        }, status=status.HTTP_401_UNAUTHORIZED)
 
 
 # --- CREATE COLLECTION ---
