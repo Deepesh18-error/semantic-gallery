@@ -1,1 +1,21 @@
 @import "tailwindcss";
+
+@theme {
+  --color-brand: #3b82f6;
+  --color-brand-hover: #2563eb;
+}
+
+/* THE FIX: This removes the annoying Vite default centering */
+:root {
+  font-family: 'Inter', system-ui, -apple-system, sans-serif;
+  line-height: 1.5;
+  background-color: #F8FAFC; /* This gives that nice light-grey 'app' feel */
+}
+
+body, #root {
+  margin: 0;
+  padding: 0;
+  width: 100%;
+  min-height: 100vh;
+  display: block; /* Removes the flex-center default from Vite */
+}
