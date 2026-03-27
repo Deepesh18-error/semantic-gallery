@@ -55,9 +55,6 @@ const Dashboard = () => {
     const fetchCollections = async () => {
       try {
         setLoading(true);
-
-        await new Promise(resolve => setTimeout(resolve, 3000));
-
         const response = await api.get('/collections/');
         setCollections(response.data);
       } catch (error) {

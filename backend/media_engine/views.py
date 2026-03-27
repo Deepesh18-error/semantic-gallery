@@ -1,4 +1,5 @@
 from rest_framework.decorators import api_view
+from django.http import FileResponse  
 from rest_framework.response import Response
 from rest_framework import status
 from rest_framework.parsers import MultiPartParser, FormParser
@@ -170,25 +171,22 @@ def upload_media(request):
         "user_id": request.user_id,
         "collection_id": collection_id,
         "media_type": media_type,
-        "file_path": file_path, # The address on disk
+        "file_path": file_path,
         "file_metadata": {
             "original_name": file_obj.name,
             "stored_name": stored_name,
             "mime_type": file_obj.content_type,
             "size_bytes": file_obj.size
         },
-        "processing_status": "PENDING", # For Phase 3 AI
+        "processing_status": "PENDING",
         "ai_data": {"description": None, "tags": []},
         "created_at": datetime.utcnow()
     }
 
+
     db.media_items.insert_one(media_doc)
 
-    return Response({
-        "message": "File uploaded and stored in vault!",
-        "media_id": media_id,
-        "status": "PENDING"
-    }, status=201)
+    return Response(media_doc, status=status.HTTP_201_CREATED)
     
     
     
