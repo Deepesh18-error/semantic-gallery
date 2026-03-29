@@ -6,7 +6,42 @@ from docx import Document as DocxDocument
 from PIL import Image
 from .database import db
 from .file_splitter import split_media, extract_thumbnail
+import subprocess
+from django.conf import settings
 
+def generate_video_thumbnail(video_path, media_id):
+    # Save to a dedicated thumbnails directory — NOT next to the video
+    thumb_dir = os.path.join(settings.MEDIA_VAULT, "thumbnails")
+    os.makedirs(thumb_dir, exist_ok=True)
+    
+    thumb_path = os.path.join(thumb_dir, f"{media_id}.jpg")
+
+    # FIX: Use -ss 0 to grab the very first frame — avoids failures on short videos
+    # FIX: Use forward slashes for FFmpeg even on Windows
+    video_path_ffmpeg = video_path.replace('\\', '/')
+    thumb_path_ffmpeg = thumb_path.replace('\\', '/')
+    
+    cmd = f'ffmpeg -y -ss 0 -i "{video_path_ffmpeg}" -vframes 1 -q:v 2 "{thumb_path_ffmpeg}"'
+
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, shell=True)
+
+        if result.returncode == 0 and os.path.exists(thumb_path):
+            print(f"✅ Thumbnail Success: {thumb_path}")
+            return thumb_path
+        else:
+            # Log the actual stderr so you can see WHY it failed
+            print(f"❌ FFmpeg Failed (returncode={result.returncode})")
+            print(f"❌ FFmpeg stderr: {result.stderr}")
+            print(f"❌ FFmpeg stdout: {result.stdout}")
+            return None
+    except Exception as e:
+        print(f"❌ Subprocess Crash: {str(e)}")
+        return None
+    
+    
+    
+    
 def process_media_item(media_id):
     item = db.media_items.find_one({"_id": media_id})
     if not item: return []
@@ -16,16 +51,24 @@ def process_media_item(media_id):
 
     if m_type == 'IMAGE':
         return _process_image(path)
-    elif m_type == 'DOCUMENT':
-        return _process_document(path)
     elif m_type == 'VIDEO':
-        # Extract thumb first for the UI
-        extract_thumbnail(path, media_id)
+        # Generate thumbnail FIRST
+        thumb_path = generate_video_thumbnail(path, media_id)
+        
+        # Save to DB immediately so the UI can find it
+        if thumb_path:
+            db.media_items.update_one(
+                {"_id": media_id},
+                {"$set": {"file_metadata.thumbnail_path": thumb_path}}
+            )
+        print(f"🖼️ Preprocessor: Saved thumbnail path to DB for {media_id}")
         return _process_multimedia(path, media_id, is_video=True)
+    
     elif m_type == 'AUDIO':
         return _process_multimedia(path, media_id, is_video=False)
     
     return []
+
 
 def _process_image(path):
     with Image.open(path) as img:

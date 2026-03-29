@@ -9,27 +9,70 @@ import {
 import api from '../services/api';
 import toast from 'react-hot-toast';
 
-// --- SECURE IMAGE STREAMER ---
-const SecureImage = ({ mediaId }) => {
+
+const SmartMediaPreview = ({ mediaId, mediaType, processingStatus }) => {
   const [imgUrl, setImgUrl] = useState(null);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    const fetchProtectedImage = async () => {
-      try {
-        const response = await api.get(`/media/file/${mediaId}/`, { responseType: 'blob' });
-        const url = URL.createObjectURL(response.data);
-        setImgUrl(url);
-      } catch (err) { console.error("Image stream failed"); } 
-      finally { setLoading(false); }
-    };
-    fetchProtectedImage();
-    return () => imgUrl && URL.revokeObjectURL(imgUrl);
-  }, [mediaId]);
+    // Don't attempt thumbnail fetch until the AI pipeline is DONE
+    // This is the key fix — no point hitting the server before the thumbnail exists
+    if (processingStatus !== 'EMBEDDED') {
+      setLoading(false);
+      return;
+    }
 
-  if (loading) return <div className="w-full h-full bg-slate-100 animate-pulse" />;
-  return <img src={imgUrl} alt="Vault Media" className="w-full h-full object-cover group-hover:scale-110 transition-transform duration-700" />;
+    let objectUrl = null;
+
+    const fetchPreview = async () => {
+      try {
+        const response = await api.get(`/media/file/${mediaId}/?thumbnail=true`, { 
+          responseType: 'blob' 
+        });
+        objectUrl = URL.createObjectURL(response.data);
+        setImgUrl(objectUrl);
+      } catch (err) { 
+        console.warn(`Preview not ready for ${mediaId}`); 
+      } finally { 
+        setLoading(false); 
+      }
+    };
+
+    fetchPreview();
+
+    // Cleanup the blob URL when the component unmounts to avoid memory leaks
+    return () => {
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    };
+  }, [mediaId, processingStatus]); // Re-run when status changes to EMBEDDED
+
+  if (loading) return (
+    <div className="w-full h-full bg-slate-50 animate-pulse flex items-center justify-center">
+      <Loader2 className="animate-spin text-slate-200 w-8 h-8" />
+    </div>
+  );
+  
+  if (!imgUrl) return (
+    <div className="flex flex-col items-center gap-3 text-slate-300">
+      {mediaType === 'VIDEO' 
+        ? <Video className="w-16 h-16 opacity-30" /> 
+        : <ImageIcon className="w-16 h-16 opacity-30" />
+      }
+      <span className="text-[9px] font-black uppercase tracking-widest bg-slate-100 px-3 py-1 rounded-full text-slate-400">
+        No Preview
+      </span>
+    </div>
+  );
+
+  return (
+    <img 
+      src={imgUrl} 
+      alt="Vault Media" 
+      className="w-full h-full object-cover group-hover:scale-110 transition-transform duration-700" 
+    />
+  );
 };
+
 
 
   const ShimmerOverlay = () => (
@@ -229,6 +272,31 @@ const CollectionDetail = () => {
     return () => clearInterval(pollingInterval.current);
   }, [pendingIds]);
 
+  // --- BULK RETRY LOGIC (Section 5) ---
+  const handleBulkRetry = async () => {
+    const failedItems = mediaItems.filter(i => i.processing_status === 'FAILED');
+    if (failedItems.length === 0) return;
+
+    const failedIds = failedItems.map(i => i._id);
+    
+    toast.promise(
+      Promise.all(failedIds.map(id => api.post(`/media/retry/${id}/`))),
+      {
+        loading: `Re-submitting ${failedIds.length} items...`,
+        success: "Batch re-submission successful! 🚀",
+        error: "Some items failed to re-submit.",
+      }
+    );
+
+    // 1. Update UI state for all failed items to PENDING locally
+    setMediaItems(prev => prev.map(item => 
+      failedIds.includes(item._id) ? { ...item, processing_status: 'PENDING', error_message: null } : item
+    ));
+
+    // 2. Re-inject into the Heartbeat Queue (Sets unique IDs to avoid duplicates)
+    setPendingIds(prev => [...new Set([...prev, ...failedIds])]);
+  };
+
 
   // --- 3. UPLOAD LOGIC (Multipart Truck + Polling Trigger) ---
   const onDrop = useCallback((acceptedFiles) => {
@@ -274,7 +342,7 @@ const CollectionDetail = () => {
     setMediaItems(prev => prev.filter(i => i._id !== mediaId));
 
     try {
-      await api.delete(`/media/delete/${mediaId}//`);
+      await api.delete(`/media/delete/${mediaId}/`);
       toast.success("Item erased from vault.");
     } catch (err) {
       toast.error("Erase failed.");
@@ -403,12 +471,11 @@ const CollectionDetail = () => {
                   {/* PREVIEW AREA */}
                   <div className={`aspect-[4/5] bg-slate-50 relative overflow-hidden flex items-center justify-center ${!isEmbedded ? 'grayscale' : ''}`}>
                     
-                    {item.media_type === 'IMAGE' ? (
-                      <SecureImage mediaId={item._id} />
+                    { (item.media_type === 'IMAGE' || item.media_type === 'VIDEO') ? (
+                      <SmartMediaPreview mediaId={item._id} mediaType={item.media_type} processingStatus={item.processing_status}  />
                     ) : (
                       <div className="flex flex-col items-center gap-3 text-slate-300">
-                        {item.media_type === 'VIDEO' ? <Video className="w-16 h-16" /> : 
-                        item.media_type === 'AUDIO' ? <Music className="w-16 h-16" /> : <FileText className="w-16 h-16" />}
+                        <FileText className="w-16 h-16 opacity-30" />
                         <span className="text-[10px] font-black uppercase tracking-widest bg-slate-100 px-3 py-1 rounded-full text-slate-400">
                           {item.media_type}
                         </span>
@@ -501,6 +568,75 @@ const CollectionDetail = () => {
         )}
       </main>
 
+      {mediaItems.filter(i => i.processing_status === 'FAILED').length > 0 && (
+      <motion.div 
+        initial={{ opacity: 0, y: 40 }} animate={{ opacity: 1, y: 0 }}
+        className="mt-24 border-t-4 border-red-50 pt-16"
+      >
+        <div className="flex items-center justify-between mb-10">
+          <div className="flex items-center gap-4">
+            <div className="bg-red-500 p-3 rounded-2xl text-white shadow-lg shadow-red-200">
+              <AlertCircle className="w-6 h-6" />
+            </div>
+            <div>
+              <h2 className="text-2xl font-black text-slate-800 tracking-tight">Vault Interruptions</h2>
+              <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">
+                {mediaItems.filter(i => i.processing_status === 'FAILED').length} items require attention
+              </p>
+            </div>
+          </div>
+
+          <button 
+            onClick={handleBulkRetry}
+            className="bg-white text-red-500 border-2 border-red-500 px-8 py-3 rounded-2xl font-black text-xs hover:bg-red-500 hover:text-white transition-all shadow-xl active:scale-95 flex items-center gap-2 cursor-pointer"
+          >
+            <RotateCcw className="w-4 h-4" /> 
+            Retry All Interruptions
+          </button>
+        </div>
+
+        {/* FAILED LIST */}
+        <div className="space-y-3">
+          {mediaItems.filter(i => i.processing_status === 'FAILED').map((item) => (
+            <motion.div 
+              key={item._id}
+              initial={{ x: -20, opacity: 0 }} animate={{ x: 0, opacity: 1 }}
+              className="bg-white border-2 border-red-50 p-6 rounded-[32px] flex items-center justify-between group hover:border-red-200 transition-all"
+            >
+              <div className="flex items-center gap-6">
+                <div className="w-12 h-12 bg-red-50 rounded-2xl flex items-center justify-center text-red-400">
+                    {item.media_type === 'IMAGE' ? <ImageIcon className="w-5 h-5" /> : <File className="w-5 h-5" />}
+                </div>
+                <div>
+                    <p className="text-sm font-black text-slate-800">{item.file_metadata.original_name}</p>
+                    <p className="text-[10px] font-bold text-red-400 uppercase tracking-tighter mt-0.5">
+                      Reason: {item.error_message || "Cloud API Timeout / Rate Limit"}
+                    </p>
+                </div>
+              </div>
+
+              <div className="flex items-center gap-3">
+                <button 
+                  onClick={() => handleRetry(item._id)}
+                  className="p-3 bg-slate-50 text-slate-400 hover:bg-red-500 hover:text-white rounded-xl transition-all shadow-sm"
+                  title="Retry this item"
+                >
+                  <RotateCcw className="w-4 h-4" />
+                </button>
+                <button 
+                  onClick={() => handleDelete(item._id)}
+                  className="p-3 bg-slate-50 text-slate-400 hover:bg-red-50 hover:text-red-500 rounded-xl transition-all shadow-sm"
+                  title="Dismiss"
+                >
+                  <Trash2 className="w-4 h-4" />
+                </button>
+              </div>
+            </motion.div>
+          ))}
+        </div>
+      </motion.div>
+    )}
+    
       {/* 5. THE DEEP BREAKDOWN MODAL (Section 3) */}
       <AnimatePresence>
         {selectedItem && (

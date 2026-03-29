@@ -4,6 +4,7 @@ from rest_framework.response import Response
 from rest_framework import status
 from rest_framework.parsers import MultiPartParser, FormParser
 from rest_framework.decorators import parser_classes
+from django.http import FileResponse, HttpResponse
 import mimetypes
 from django.conf import settings
 import os
@@ -206,56 +207,84 @@ def upload_media(request):
 @api_view(['GET'])
 @token_required
 def serve_media_file(request, media_id):
-    # 1. Find the metadata in MongoDB
-    media_item = db.media_items.find_one({"_id": media_id, "user_id": request.user_id})
+    item = db.media_items.find_one({"_id": media_id})
+    if not item: 
+        print(f"❌ View: ID {media_id} not found in MongoDB.")
+        return HttpResponse(status=404)
+
+    is_thumbnail = request.GET.get('thumbnail') == 'true'
+
+    if is_thumbnail:
+        # Check exactly where the path is stored
+        file_path = item.get('file_metadata', {}).get('thumbnail_path')
+        print(f"🔍 View: Searching for thumbnail for {media_id}")
+        print(f"📂 View: Path from DB is -> {file_path}")
+        content_type = 'image/jpeg'
+    else:
+        file_path = item.get('file_path')
+        content_type = item.get('file_metadata', {}).get('mime_type')
+
+    if not file_path:
+        print(f"❌ View: The 'thumbnail_path' field is EMPTY in MongoDB for this item.")
+        return HttpResponse(status=404)
+
+    if not os.path.exists(file_path):
+        print(f"❌ View: Physical file NOT FOUND on disk at: {file_path}")
+        return HttpResponse(status=404)
+
+    print(f"✅ View: Serving file successfully!")
+    return FileResponse(open(file_path, 'rb'), content_type=content_type)
+
+
+
+@api_view(['DELETE'])
+@token_required # 🚀 Keep your security!
+def delete_media_item(request, media_id):
+    # 1. Fetch metadata & verify ownership (Security first)
+    media_item = db.media_items.find_one({
+        "_id": media_id, 
+        "user_id": request.user_id 
+    })
     
     if not media_item:
         return Response({"error": "File not found or access denied"}, status=404)
 
-    file_path = media_item['file_path']
+    try:
+        # 🚀 STEP 1: ERASE FROM PINECONE (The Librarian)
+        # Delete all chunks/segments at once using the list we saved
+        vector_ids = media_item.get('vector_ids', [])
+        if vector_ids:
+            try:
+                index = get_pinecone_index() # Use your existing helper
+                index.delete(ids=vector_ids)
+                print(f"🗑️ Pinecone: Erased {len(vector_ids)} vectors.")
+            except Exception as e:
+                print(f"⚠️ Pinecone Deletion Warning: {e}")
 
-    # 2. Check if the file actually exists on the hard drive
-    if not os.path.exists(file_path):
-        return Response({"error": "Physical file missing from vault"}, status=404)
+        # 🚀 STEP 2: ERASE FROM DISK (The Physical Vault)
+        # A. Delete the main file (Video/PDF/Image)
+        file_path = media_item.get('file_path')
+        if file_path and os.path.exists(file_path):
+            os.remove(file_path)
+            print(f"🗑️ Vault: Main file erased.")
 
-    # 3. Detect the "Flavor" (MIME type) of the file (e.g., image/jpeg)
-    content_type, _ = mimetypes.guess_type(file_path)
+        # B. Delete the Thumbnail (The missing logic from your version)
+        # This cleans up the .jpg files we generate for videos
+        thumb_path = media_item.get('file_metadata', {}).get('thumbnail_path')
+        if thumb_path and os.path.exists(thumb_path):
+            os.remove(thumb_path)
+            print("🗑️ Vault: Thumbnail erased.")
+
+        # 🚀 STEP 3: ERASE FROM MONGODB (The Metadata)
+        db.media_items.delete_one({"_id": media_id})
+        print("🗑️ MongoDB: Metadata purged.")
+
+        return Response({"success": "Item wiped from system"}, status=200)
+
+    except Exception as e:
+        print(f"❌ Delete Error: {str(e)}")
+        return Response({"error": "Failed to complete full erase"}, status=500)
     
-    # 4. Stream the bytes to the browser
-    # Intuition: This opens a "Live Pipe" between the vault and the user's screen
-    response = FileResponse(open(file_path, 'rb'), content_type=content_type)
-    return response
-
-
-# --- 2. THE ERASER (Delete File) ---
-@api_view(['DELETE'])
-@token_required
-def delete_media_item(request, media_id):
-    # 1. Find the metadata first
-    media_item = db.media_items.find_one({"_id": media_id, "user_id": request.user_id})
-    if not media_item:
-        return Response({"error": "File not found"}, status=404)
-
-    # 🚀 NEW PHASE 3: DELETE FROM PINECONE FIRST
-    # We use the list we saved in the Orchestrator!
-    vector_ids = media_item.get('vector_ids', [])
-    if vector_ids:
-        try:
-            index = get_pinecone_index()
-            index.delete(ids=vector_ids) # Delete all chunks/segments at once
-            print(f"🗑️ Pinecone: Deleted {len(vector_ids)} vectors.")
-        except Exception as e:
-            print(f"⚠️ Pinecone Deletion Failed: {e}")
-
-    # 2. DELETE FROM HARD DRIVE
-    file_path = media_item['file_path']
-    if os.path.exists(file_path):
-        os.remove(file_path)
-
-    # 3. DELETE FROM MONGODB (The Final Step)
-    db.media_items.delete_one({"_id": media_id})
-
-    return Response({"message": "File and AI index deleted."})
 
 
 @api_view(['POST'])

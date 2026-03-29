@@ -1,5 +1,5 @@
+from pinecone import Pinecone, ServerlessSpec
 import os
-from pinecone import Pinecone
 from django.conf import settings
 
 #  THE LIBRARIAN 

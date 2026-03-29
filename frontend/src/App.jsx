@@ -6,6 +6,7 @@ import { Toaster } from 'react-hot-toast';
 import { useAuthStore } from './store/authStore';
 import Dashboard from './pages/Dashboard';
 import CollectionDetail from './pages/CollectionDetail';
+import Settings from './pages/Settings';
 
 
 function App() {
@@ -22,6 +23,8 @@ function App() {
           path="/" 
           element={token ? <Dashboard /> : <Navigate to="/login" replace />} 
         />
+
+        <Route path="/settings" element={token ? <Settings /> : <Navigate to="/login" replace />} />
         
         <Route path="/login" element={<Login />} />
         
