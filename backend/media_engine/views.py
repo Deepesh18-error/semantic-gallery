@@ -12,6 +12,8 @@ from datetime import datetime
 from .database import db
 from .auth_service import hash_password, verify_password, create_token , token_required
 from .utils import validate_file
+from .embedding_tasks import start_background_embedding
+from .pinecone_service import get_pinecone_index
 
 
 @api_view(['POST'])
@@ -178,14 +180,23 @@ def upload_media(request):
             "mime_type": file_obj.content_type,
             "size_bytes": file_obj.size
         },
-        "processing_status": "PENDING",
-        "ai_data": {"description": None, "tags": []},
+        #  NEW PHASE 3 TRACKING FIELDS 
+        "processing_status": "PENDING", # PENDING -> PROCESSING -> EMBEDDED/FAILED
+        "embedding_started_at": None,
+        "embedding_ended_at": None,
+        "total_vectors": 0,
+        "vector_ids": [], # We will fill this with Pinecone IDs later
+        "error_message": None,
         "created_at": datetime.utcnow()
     }
 
 
     db.media_items.insert_one(media_doc)
 
+    # 🚀 TRIGGER THE AI PIPELINE
+    # We send the ID in a list so the dispatcher can handle batches
+    start_background_embedding([media_id]) 
+    
     return Response(media_doc, status=status.HTTP_201_CREATED)
     
     
@@ -220,26 +231,47 @@ def serve_media_file(request, media_id):
 @api_view(['DELETE'])
 @token_required
 def delete_media_item(request, media_id):
-    # 1. Find the file first to get the path
+    # 1. Find the metadata first
     media_item = db.media_items.find_one({"_id": media_id, "user_id": request.user_id})
-    
     if not media_item:
-        return Response({"error": "File not found or access denied"}, status=404)
+        return Response({"error": "File not found"}, status=404)
 
+    # 🚀 NEW PHASE 3: DELETE FROM PINECONE FIRST
+    # We use the list we saved in the Orchestrator!
+    vector_ids = media_item.get('vector_ids', [])
+    if vector_ids:
+        try:
+            index = get_pinecone_index()
+            index.delete(ids=vector_ids) # Delete all chunks/segments at once
+            print(f"🗑️ Pinecone: Deleted {len(vector_ids)} vectors.")
+        except Exception as e:
+            print(f"⚠️ Pinecone Deletion Failed: {e}")
+
+    # 2. DELETE FROM HARD DRIVE
     file_path = media_item['file_path']
+    if os.path.exists(file_path):
+        os.remove(file_path)
 
-    # 2. DELETE FROM HARD DRIVE (The Physical Part)
-    try:
-        if os.path.exists(file_path):
-            os.remove(file_path)
-            print(f"🗑️ Physically deleted: {file_path}")
-    except Exception as e:
-        # We log the error but continue to delete the DB record
-        print(f"⚠️ Error deleting physical file: {e}")
-
-    # 3. DELETE FROM MONGODB (The Metadata Part)
+    # 3. DELETE FROM MONGODB (The Final Step)
     db.media_items.delete_one({"_id": media_id})
 
-    # Note: In Phase 4, we will add Step 4: Delete from Pinecone here!
+    return Response({"message": "File and AI index deleted."})
 
-    return Response({"message": "File and metadata deleted successfully"}, status=200)
+
+@api_view(['POST'])
+@token_required
+def check_embedding_status(request):
+    """
+    Receives a list of media_ids.
+    Returns their current processing_status.
+    Used by the React Frontend for polling.
+    """
+    media_ids = request.data.get('media_ids', [])
+    
+    # Fetch only the status and error_message for these IDs
+    items = list(db.media_items.find(
+        {"_id": {"$in": media_ids}, "user_id": request.user_id},
+        {"_id": 1, "processing_status": 1, "error_message": 1}
+    ))
+    
+    return Response(items)
