@@ -4,7 +4,7 @@ import { useDropzone } from 'react-dropzone';
 import { motion, AnimatePresence } from 'framer-motion';
 import { 
   ArrowLeft, Upload, File, Image as ImageIcon, Video, 
-  Music, Loader2, Trash2, Clock, HardDrive, Play, FileText, MousePointer2 
+  Music, Loader2, Trash2, Clock, HardDrive, Play, FileText, MousePointer2, Check, XCircle, RotateCcw, AlertCircle
 } from 'lucide-react';
 import api from '../services/api';
 import toast from 'react-hot-toast';
@@ -31,6 +31,112 @@ const SecureImage = ({ mediaId }) => {
   return <img src={imgUrl} alt="Vault Media" className="w-full h-full object-cover group-hover:scale-110 transition-transform duration-700" />;
 };
 
+
+  const ShimmerOverlay = () => (
+    <motion.div
+      initial={{ x: '-100%' }}
+      animate={{ x: '100%' }}
+      transition={{ repeat: Infinity, duration: 1.5, ease: 'linear' }}
+      className="absolute inset-0 bg-gradient-to-r from-transparent via-white/30 to-transparent z-10"
+    />
+  );
+
+
+const MediaDetailModal = ({ item, onClose }) => {
+  if (!item) return null;
+
+  return (
+    <motion.div 
+      initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
+      className="fixed inset-0 z-[100] flex items-center justify-end p-6 bg-slate-900/60 backdrop-blur-md"
+      onClick={onClose}
+    >
+      <motion.div 
+        initial={{ x: '100%' }} animate={{ x: 0 }} exit={{ x: '100%' }}
+        className="bg-white h-full w-full max-w-2xl rounded-[40px] shadow-2xl overflow-hidden flex flex-col"
+        onClick={e => e.stopPropagation()} // Prevent closing when clicking inside
+      >
+        {/* MODAL HEADER */}
+        <div className="p-8 border-b border-slate-100 flex justify-between items-center">
+          <div>
+            <h2 className="text-2xl font-black text-slate-900 truncate max-w-md">{item.file_metadata.original_name}</h2>
+            <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest mt-1">Deep Index Intelligence Report</p>
+          </div>
+          <button onClick={onClose} className="p-3 hover:bg-slate-100 rounded-2xl transition-all"><XCircle /></button>
+        </div>
+
+        {/* MODAL CONTENT */}
+        <div className="flex-1 overflow-y-auto p-8">
+          
+          {/* 1. DOCUMENT CHUNK BREAKDOWN */}
+          {item.media_type === 'DOCUMENT' && (
+            <div className="space-y-6">
+              <div className="flex items-center gap-3 mb-8">
+                <FileText className="text-brand w-8 h-8" />
+                <h3 className="font-black text-slate-800">Sliding Window Chunks ({item.total_vectors})</h3>
+              </div>
+              <div className="grid gap-3">
+                {[...Array(item.total_vectors)].map((_, i) => (
+                  <div key={i} className="group p-5 bg-slate-50 border border-slate-100 rounded-3xl hover:border-brand transition-all">
+                    <div className="flex justify-between items-center">
+                      <span className="text-xs font-black text-slate-400 uppercase">Vector #{i + 1}</span>
+                      <span className="bg-white px-3 py-1 rounded-full text-[10px] font-bold text-slate-400 border border-slate-100">500 Tokens</span>
+                    </div>
+                    <p className="text-sm text-slate-500 mt-3 italic line-clamp-2">"This is a placeholder for chunk text preview. When we implement search, we will see the actual content that matched here..."</p>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* 2. VIDEO/AUDIO TIMELINE VISUALIZATION */}
+          {(item.media_type === 'VIDEO' || item.media_type === 'AUDIO') && (
+            <div className="space-y-10">
+              <div className="flex items-center gap-3">
+                {item.media_type === 'VIDEO' ? <Video className="text-brand w-8 h-8" /> : <Music className="text-brand w-8 h-8" />}
+                <h3 className="font-black text-slate-800">Temporal Index Breakdown</h3>
+              </div>
+              
+              {/* THE TIMELINE BAR */}
+              <div className="relative pt-10 pb-20">
+                <div className="h-4 w-full bg-slate-100 rounded-full relative">
+                  {[...Array(item.total_vectors)].map((_, i) => {
+                    const width = 100 / item.total_vectors;
+                    return (
+                      <div 
+                        key={i} 
+                        className="absolute h-full border-r-2 border-white hover:bg-brand transition-all cursor-help group"
+                        style={{ left: `${i * (width - 2)}%`, width: `${width}%`, backgroundColor: i % 2 === 0 ? '#3b82f6' : '#60a5fa' }}
+                      >
+                        {/* Segment Hover Label */}
+                        <div className="absolute -bottom-12 left-1/2 -translate-x-1/2 opacity-0 group-hover:opacity-100 transition-all pointer-events-none whitespace-nowrap bg-slate-900 text-white text-[9px] px-3 py-1.5 rounded-lg shadow-xl font-black">
+                           SEGMENT {i+1} • {i*120}s - {(i+1)*120}s
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+                <div className="flex justify-between mt-4 text-[10px] font-black text-slate-300 uppercase tracking-widest">
+                   <span>00:00 Start</span>
+                   <span>End of Media</span>
+                </div>
+              </div>
+
+              <div className="bg-slate-50 p-8 rounded-[40px] border border-slate-100">
+                <h4 className="text-xs font-black text-slate-400 uppercase tracking-widest mb-4">Why is this split?</h4>
+                <p className="text-sm text-slate-500 leading-relaxed font-medium">
+                  To ensure maximum semantic accuracy, our AI slices your media into 120-second segments with a 10-second overlap. This prevents context loss at the edges of clips, making even the shortest mention searchable.
+                </p>
+              </div>
+            </div>
+          )}
+        </div>
+      </motion.div>
+    </motion.div>
+  );
+};
+
+
 const CollectionDetail = () => {
   const { id: collectionId } = useParams();
   const navigate = useNavigate();
@@ -41,6 +147,7 @@ const CollectionDetail = () => {
   const [uploadQueue, setUploadQueue] = useState([]); // Tracks byte progress (Upload Progress)
   const [pendingIds, setPendingIds] = useState([]);   // Tracks AI progress (Polling Queue)
   const [loading, setLoading] = useState(true);
+  const [selectedItem, setSelectedItem] = useState(null);
 
   const pollingInterval = useRef(null); // Ref to manage the timer cleanly
 
@@ -175,6 +282,26 @@ const CollectionDetail = () => {
     }
   };
 
+
+  const handleRetry = async (mediaId) => {
+    try {
+      await api.post(`/media/retry/${mediaId}/`);
+      
+      // 1. Update local state to PENDING immediately
+      setMediaItems(prev => prev.map(item => 
+        item._id === mediaId ? { ...item, processing_status: 'PENDING', error_message: null } : item
+      ));
+
+      // 2. Re-add to polling queue to resume heartbeat
+      setPendingIds(prev => [...new Set([...prev, mediaId])]);
+      
+      toast.success("Re-submitting to the AI Vault...");
+    } catch (err) {
+      toast.error("Retry failed. System offline.");
+    }
+  };
+
+
   if (loading) return (
     <div className="min-h-screen flex items-center justify-center bg-slate-50">
       <Loader2 className="animate-spin text-brand w-12 h-12" />
@@ -184,7 +311,7 @@ const CollectionDetail = () => {
   return (
     <div className="min-h-screen bg-[#F8FAFC]">
       
-      {/* HEADER SYSTEM */}
+      {/* 1. HEADER SYSTEM */}
       <header className="bg-white border-b border-slate-200 sticky top-0 z-50 px-8 py-5 flex items-center justify-between">
         <div className="flex items-center gap-5">
           <Link to="/" className="p-2.5 hover:bg-slate-50 rounded-2xl border border-transparent hover:border-slate-100 transition-all">
@@ -213,7 +340,7 @@ const CollectionDetail = () => {
 
       <main className="max-w-7xl mx-auto px-8 py-12">
         
-        {/* INGESTION ENGINE (Dropzone) */}
+        {/* 2. INGESTION ENGINE (Dropzone) */}
         <div {...getRootProps()} className={`
           border-4 border-dashed rounded-[48px] p-16 text-center transition-all cursor-pointer mb-16
           ${isDragActive ? 'bg-brand/5 border-brand scale-[0.99] shadow-2xl shadow-brand/10' : 'bg-white border-slate-100 hover:border-slate-200 shadow-sm'}
@@ -226,7 +353,7 @@ const CollectionDetail = () => {
           <p className="text-slate-400 font-bold uppercase tracking-widest text-[10px]">Images • Video • Audio • PDF • Documents</p>
         </div>
 
-        {/* THE TRUCK (Upload Queue) */}
+        {/* 3. THE TRUCK (Upload Queue for Bytes Progress) */}
         <AnimatePresence>
           {uploadQueue.length > 0 && (
             <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }} className="mb-12 grid grid-cols-1 md:grid-cols-2 gap-4">
@@ -245,62 +372,125 @@ const CollectionDetail = () => {
           )}
         </AnimatePresence>
 
-        {/* STEP 4: INTELLIGENCE-READY GRID (Gallery) */}
+        {/* 4. INTELLIGENCE-READY GRID (The Gallery) */}
         {mediaItems.length > 0 ? (
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-8">
-            {mediaItems.map((item) => (
-              <motion.div 
-                layout
-                key={item._id} 
-                className="group bg-white rounded-[40px] border border-slate-100 overflow-hidden hover:shadow-2xl transition-all duration-500 relative"
-              >
-                {/* Component Switcher */}
-                <div className="aspect-[4/5] bg-slate-50 relative overflow-hidden flex items-center justify-center">
-                  {item.media_type === 'IMAGE' ? (
-                    <SecureImage mediaId={item._id} />
-                  ) : (
-                    <div className="flex flex-col items-center gap-3 text-slate-300">
-                      {item.media_type === 'VIDEO' ? <Video className="w-16 h-16" /> : 
-                       item.media_type === 'AUDIO' ? <Music className="w-16 h-16" /> : <FileText className="w-16 h-16" />}
-                      <span className="text-[10px] font-black uppercase tracking-widest bg-slate-100 px-3 py-1 rounded-full text-slate-400">{item.media_type}</span>
+            {mediaItems.map((item) => {
+              const status = item.processing_status || 'PENDING';
+              const isEmbedded = status === 'EMBEDDED';
+              const isProcessing = status === 'PROCESSING';
+              const isFailed = status === 'FAILED';
+
+              return (
+                <motion.div 
+                  layout
+                  key={item._id} 
+                  // Trigger the Detail Modal only when index is complete
+                  onClick={() => isEmbedded && setSelectedItem(item)}
+                  initial={false}
+                  animate={{
+                    opacity: isEmbedded ? 1 : isFailed ? 0.9 : 0.7,
+                    scale: isEmbedded ? [1, 1.05, 1] : 1,
+                  }}
+                  transition={{ duration: 0.5 }}
+                  className={`
+                    group bg-white rounded-[40px] border border-slate-100 overflow-hidden relative
+                    transition-all duration-500
+                    ${isEmbedded ? 'hover:shadow-2xl cursor-pointer' : 'pointer-events-none'}
+                    ${isFailed ? 'border-red-100' : ''}
+                  `}
+                >
+                  {/* PREVIEW AREA */}
+                  <div className={`aspect-[4/5] bg-slate-50 relative overflow-hidden flex items-center justify-center ${!isEmbedded ? 'grayscale' : ''}`}>
+                    
+                    {item.media_type === 'IMAGE' ? (
+                      <SecureImage mediaId={item._id} />
+                    ) : (
+                      <div className="flex flex-col items-center gap-3 text-slate-300">
+                        {item.media_type === 'VIDEO' ? <Video className="w-16 h-16" /> : 
+                        item.media_type === 'AUDIO' ? <Music className="w-16 h-16" /> : <FileText className="w-16 h-16" />}
+                        <span className="text-[10px] font-black uppercase tracking-widest bg-slate-100 px-3 py-1 rounded-full text-slate-400">
+                          {item.media_type}
+                        </span>
+                      </div>
+                    )}
+
+                    {/* SHIMMER EFFECT (Section 2) */}
+                    {isProcessing && <ShimmerOverlay />}
+
+                    {/* STATUS BADGE OVERLAYS (Section 1 & 2) */}
+                    <div className="absolute top-4 left-4 z-20">
+                      {status === 'PENDING' && (
+                        <div className="bg-slate-500/90 backdrop-blur-md text-white px-3 py-1.5 rounded-2xl flex items-center gap-2 text-[10px] font-black uppercase tracking-widest shadow-lg">
+                          <Clock className="w-3.5 h-3.5" /> Queued
+                        </div>
+                      )}
+                      {isProcessing && (
+                        <div className="bg-brand backdrop-blur-md text-white px-3 py-1.5 rounded-2xl flex items-center gap-2 text-[10px] font-black uppercase tracking-widest shadow-lg animate-pulse">
+                          <Loader2 className="w-3.5 h-3.5 animate-spin" /> Analyzing...
+                        </div>
+                      )}
+                      {isEmbedded && (
+                        <div className="bg-emerald-500 text-white px-3 py-1.5 rounded-2xl flex items-center gap-2 text-[10px] font-black uppercase tracking-widest shadow-lg">
+                          <Check className="w-3.5 h-3.5" /> Ready
+                        </div>
+                      )}
+                      {isFailed && (
+                        <div className="bg-red-500 text-white px-3 py-1.5 rounded-2xl flex items-center gap-2 text-[10px] font-black uppercase tracking-widest shadow-lg">
+                          <XCircle className="w-3.5 h-3.5" /> Failed
+                        </div>
+                      )}
                     </div>
-                  )}
 
-                  {/* Syncing Badge */}
-                {item.processing_status === 'PENDING' && (
-                <div className="absolute top-4 left-4 right-4 z-10 py-2 px-3 bg-slate-900/80 backdrop-blur-md rounded-2xl flex items-center gap-2 border border-white/10 shadow-xl">
-                    {/* A small pulsing clock icon */}
-                    <Clock className="w-3.5 h-3.5 text-brand animate-pulse" />
-                    {/* Clean text badge */}
-                    <span className="text-[9px] font-black uppercase tracking-widest text-white">
-                    Vaulting...
-                    </span>
-                </div>
-                )}
-                </div>
-
-                {/* Footer */}
-                <div className="p-6">
-                  <div className="flex justify-between items-start">
-                    <div className="max-w-[70%]">
-                        <p className="text-sm font-black text-slate-800 truncate">
-                            {item.file_metadata?.original_name || "Unknown File"}
-                            </p>
-
-                            <p className="text-[10px] font-bold text-slate-400">
-                                {((item.file_metadata?.size_bytes || 0) / 1024 / 1024).toFixed(1)} MB
-                            </p>
-                        <p className="text-[10px] font-bold text-slate-400 uppercase tracking-tighter">
-                            {(item.file_metadata.size_bytes / 1024 / 1024).toFixed(1)} MB • {item.media_type}
-                        </p>
-                    </div>
-                    <button onClick={() => handleDelete(item._id)} className="p-3 text-slate-300 hover:text-red-500 hover:bg-red-50 rounded-2xl transition-all">
-                        <Trash2 className="w-5 h-5" />
-                    </button>
+                    {/* RETRY BUTTON (Section 2) */}
+                    {isFailed && (
+                      <div className="absolute inset-0 bg-red-50/60 backdrop-blur-[1px] flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity pointer-events-auto">
+                        <button 
+                          onClick={(e) => { e.stopPropagation(); handleRetry(item._id); }}
+                          className="bg-white text-red-500 px-6 py-3 rounded-2xl font-black text-xs flex items-center gap-2 shadow-xl hover:bg-red-500 hover:text-white transition-all transform active:scale-95 cursor-pointer"
+                        >
+                          <RotateCcw className="w-4 h-4" /> Retry AI Index
+                        </button>
+                      </div>
+                    )}
                   </div>
-                </div>
-              </motion.div>
-            ))}
+
+                  {/* FOOTER INFO */}
+                  <div className="p-6">
+                    <div className="flex flex-col gap-4">
+                      <div className="flex justify-between items-start">
+                        <div className="max-w-[80%]">
+                          <p className={`text-sm font-black truncate ${isEmbedded ? 'text-slate-800' : 'text-slate-400'}`}>
+                            {item.file_metadata?.original_name || "Unknown File"}
+                          </p>
+                          <p className="text-[10px] font-bold text-slate-400 uppercase tracking-tighter mt-1">
+                            {((item.file_metadata?.size_bytes || 0) / 1024 / 1024).toFixed(1)} MB • {item.media_type}
+                          </p>
+                        </div>
+                        
+                        <button 
+                          onClick={(e) => { e.stopPropagation(); isEmbedded && handleDelete(item._id); }} 
+                          className={`p-3 rounded-2xl transition-all ${isEmbedded ? 'text-slate-300 hover:text-red-500 hover:bg-red-50' : 'text-slate-100 pointer-events-none'}`}
+                          disabled={!isEmbedded}
+                        >
+                          <Trash2 className="w-5 h-5" />
+                        </button>
+                      </div>
+
+                      {/* 🧠 INTELLIGENCE CHIP (Section 3) */}
+                      {isEmbedded && item.total_vectors > 0 && (
+                        <div className="flex">
+                          <div className="bg-slate-900 text-[9px] font-black text-white px-3 py-1.5 rounded-xl uppercase tracking-wider flex items-center gap-2 shadow-sm border border-white/10">
+                            <div className="w-1.5 h-1.5 bg-brand rounded-full animate-pulse" />
+                            {item.total_vectors} {item.media_type === 'DOCUMENT' ? 'Semantic Chunks' : 'AI Segments'}
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                </motion.div>
+              );
+            })}
           </div>
         ) : (
           <div className="text-center py-32 bg-white rounded-[60px] border-4 border-dashed border-slate-50">
@@ -310,6 +500,17 @@ const CollectionDetail = () => {
           </div>
         )}
       </main>
+
+      {/* 5. THE DEEP BREAKDOWN MODAL (Section 3) */}
+      <AnimatePresence>
+        {selectedItem && (
+          <MediaDetailModal 
+            item={selectedItem} 
+            onClose={() => setSelectedItem(null)} 
+          />
+        )}
+      </AnimatePresence>
+
     </div>
   );
 };
