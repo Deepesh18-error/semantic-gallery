@@ -275,3 +275,97 @@ def check_embedding_status(request):
     ))
     
     return Response(items)
+
+
+
+@api_view(['GET'])
+@token_required
+def get_media_batch_status(request):
+    """
+    Called by React every 3s.
+    Input: ?ids=uuid1,uuid2
+    Output: Status of each file.
+    """
+    ids_string = request.query_params.get('ids', '')
+    if not ids_string:
+        return Response([])
+
+    media_ids = ids_string.split(',')
+    
+    # We only fetch the essential status fields for speed
+    items = list(db.media_items.find(
+        {"_id": {"$in": media_ids}, "user_id": request.user_id},
+        {"_id": 1, "processing_status": 1, "error_message": 1, "total_vectors": 1}
+    ))
+    
+    return Response(items)
+
+# --- 2. THE SECOND CHANCE (Retry) ---
+@api_view(['POST'])
+@token_required
+def retry_embedding(request, media_id):
+    """
+    If a file is FAILED, this kicks it back into the pipeline.
+    """
+    item = db.media_items.find_one({"_id": media_id, "user_id": request.user_id})
+    if not item:
+        return Response({"error": "File not found"}, status=404)
+
+    # Reset status to PENDING
+    db.media_items.update_one(
+        {"_id": media_id},
+        {"$set": {"processing_status": "PENDING", "error_message": None}}
+    )
+
+    # Re-trigger the background thread
+    start_background_embedding([media_id])
+    
+    return Response({"message": "Retry started."})
+
+# --- 3. THE INSPECTOR (Embedding Info) ---
+@api_view(['GET'])
+@token_required
+def get_embedding_info(request, media_id):
+    """Returns the deep AI metadata for a file."""
+    item = db.media_items.find_one(
+        {"_id": media_id, "user_id": request.user_id},
+        {
+            "processing_status": 1, 
+            "total_vectors": 1, 
+            "vector_ids": 1, 
+            "embedding_started_at": 1, 
+            "embedding_ended_at": 1
+        }
+    )
+    if not item:
+        return Response({"error": "Not found"}, status=404)
+    return Response(item)
+
+# --- 4. THE ERASER (Updated Delete Logic) ---
+@api_view(['DELETE'])
+@token_required
+def delete_media_item(request, media_id):
+    item = db.media_items.find_one({"_id": media_id, "user_id": request.user_id})
+    if not item:
+        return Response({"error": "File not found"}, status=404)
+
+    # A. DELETE FROM PINECONE FIRST (Cloud)
+    vector_ids = item.get('vector_ids', [])
+    if vector_ids:
+        try:
+            index = get_pinecone_index()
+            index.delete(ids=vector_ids)
+            print(f"🗑️ Deleted {len(vector_ids)} vectors from Pinecone.")
+        except Exception as e:
+            print(f"⚠️ Pinecone delete failed: {e}")
+
+    # B. DELETE FROM VAULT (Physical)
+    file_path = item['file_path']
+    if os.path.exists(file_path):
+        os.remove(file_path)
+
+    # C. DELETE FROM MONGODB (Metadata)
+    db.media_items.delete_one({"_id": media_id})
+
+    return Response({"message": "Fully erased."})
+
