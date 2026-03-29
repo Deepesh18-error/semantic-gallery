@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useCallback } from 'react';
+import React, { useEffect, useState, useCallback, useRef } from 'react';
 import { useParams, useNavigate, Link } from 'react-router-dom';
 import { useDropzone } from 'react-dropzone';
 import { motion, AnimatePresence } from 'framer-motion';
@@ -9,8 +9,7 @@ import {
 import api from '../services/api';
 import toast from 'react-hot-toast';
 
-// --- STEP 5: SECURE IMAGE STREAMER ---
-// Since files are protected by JWT, we fetch them as Blobs and create a local URL.
+// --- SECURE IMAGE STREAMER ---
 const SecureImage = ({ mediaId }) => {
   const [imgUrl, setImgUrl] = useState(null);
   const [loading, setLoading] = useState(true);
@@ -21,14 +20,11 @@ const SecureImage = ({ mediaId }) => {
         const response = await api.get(`/media/file/${mediaId}/`, { responseType: 'blob' });
         const url = URL.createObjectURL(response.data);
         setImgUrl(url);
-      } catch (err) {
-        console.error("Image stream failed");
-      } finally {
-        setLoading(false);
-      }
+      } catch (err) { console.error("Image stream failed"); } 
+      finally { setLoading(false); }
     };
     fetchProtectedImage();
-    return () => imgUrl && URL.revokeObjectURL(imgUrl); // Memory cleanup
+    return () => imgUrl && URL.revokeObjectURL(imgUrl);
   }, [mediaId]);
 
   if (loading) return <div className="w-full h-full bg-slate-100 animate-pulse" />;
@@ -39,26 +35,41 @@ const CollectionDetail = () => {
   const { id: collectionId } = useParams();
   const navigate = useNavigate();
 
+  // --- STATE SYSTEM ---
   const [collection, setCollection] = useState(null);
   const [mediaItems, setMediaItems] = useState([]);
-  const [uploadQueue, setUploadQueue] = useState([]);
+  const [uploadQueue, setUploadQueue] = useState([]); // Tracks byte progress (Upload Progress)
+  const [pendingIds, setPendingIds] = useState([]);   // Tracks AI progress (Polling Queue)
   const [loading, setLoading] = useState(true);
 
-  // --- STEP 1: CONTEXTUAL HEADER FETCH ---
+  const pollingInterval = useRef(null); // Ref to manage the timer cleanly
+
+  // --- 1. INITIAL DATA FETCH & BOOTSTRAP POLLING ---
   useEffect(() => {
     const fetchVaultData = async () => {
       try {
         setLoading(true);
-        // 1. Get collection details to theme the page
+        // Fetch Collection Info
         const colRes = await api.get('/collections/');
         const found = colRes.data.find(c => c._id === collectionId);
         if (!found) return navigate('/');
         setCollection(found);
 
-        // 2. Fetch media items for this specific collection
-        // Note: Ensure your backend supports this filtering logic
-        const mediaRes = await api.get('/collections/'); // Temporary: replace with actual media list endpoint
-        // setMediaItems(mediaRes.data.filter(i => i.collection_id === collectionId)); 
+        // Fetch Items (Using the collections endpoint for now as per your code)
+        // In the future, this should be: api.get(`/collections/${collectionId}/media/`)
+        const mediaRes = await api.get('/collections/'); 
+        const items = mediaRes.data; // Filter these as needed based on your DB structure
+        setMediaItems(items);
+
+        // 🧠 BOOTSTRAP: If any items are already PENDING in DB, add them to polling queue
+        const unfinished = items
+          .filter(i => i.processing_status === 'PENDING' || i.processing_status === 'PROCESSING')
+          .map(i => i._id);
+        
+        if (unfinished.length > 0) {
+            setPendingIds(unfinished);
+        }
+
       } catch (err) {
         toast.error("Vault access denied.");
       } finally {
@@ -68,12 +79,56 @@ const CollectionDetail = () => {
     fetchVaultData();
   }, [collectionId, navigate]);
 
-  // --- STEP 2 & 3: THE MULTIPART TRUCK (Upload Logic) ---
+
+  // --- 2. THE HEARTBEAT ENGINE (Phase 3 Section 1) ---
+  useEffect(() => {
+    // If no items are pending, kill the interval and stop
+    if (pendingIds.length === 0) {
+      if (pollingInterval.current) clearInterval(pollingInterval.current);
+      return;
+    }
+
+    // Start Polling every 3 seconds
+    pollingInterval.current = setInterval(async () => {
+      try {
+        const idsParam = pendingIds.join(',');
+        const response = await api.get(`/media/status/?ids=${idsParam}`);
+        const statusUpdates = response.data; // Array of {_id, processing_status, error_message}
+
+        // A. Update the UI Cards with new statuses
+        setMediaItems(prevItems => prevItems.map(item => {
+          const update = statusUpdates.find(u => u._id === item._id);
+          return update ? { ...item, ...update } : item;
+        }));
+
+        // B. Update the Polling Queue (remove items that are no longer pending)
+        const stillPending = statusUpdates
+          .filter(u => u.processing_status === 'PENDING' || u.processing_status === 'PROCESSING')
+          .map(u => u._id);
+        
+        setPendingIds(stillPending);
+
+        // C. Success Notification
+        const justFinished = statusUpdates.filter(u => u.processing_status === 'EMBEDDED');
+        if (justFinished.length > 0) {
+            toast.success(`${justFinished.length} items fully indexed! 🧠`, { id: 'status-update' });
+        }
+      } catch (err) {
+        console.error("Heartbeat Check Failed", err);
+      }
+    }, 3000);
+
+    // Cleanup when component closes or pendingIds changes
+    return () => clearInterval(pollingInterval.current);
+  }, [pendingIds]);
+
+
+  // --- 3. UPLOAD LOGIC (Multipart Truck + Polling Trigger) ---
   const onDrop = useCallback((acceptedFiles) => {
     acceptedFiles.forEach(async (file) => {
       const tempId = Math.random().toString(36).substring(7);
       
-      // Add to visual queue
+      // Step 1: Add to Visual Queue (Progress Bar)
       setUploadQueue(prev => [...prev, { id: tempId, name: file.name, progress: 0 }]);
 
       const formData = new FormData();
@@ -88,9 +143,14 @@ const CollectionDetail = () => {
           }
         });
         
-        // Success: Inject new item into gallery and remove from queue
-        setMediaItems(prev => [res.data, ...prev]);
+        // Step 2: Upload Complete! Remove from Queue and Add to Gallery
+        const newItem = res.data;
+        setMediaItems(prev => [newItem, ...prev]);
         setUploadQueue(q => q.filter(i => i.id !== tempId));
+
+        // Step 3: TRIGGER THE HEARTBEAT (Add to polling queue)
+        setPendingIds(prev => [...prev, newItem._id]);
+
         toast.success(`Ingested: ${file.name}`);
       } catch (err) {
         toast.error(`Failed: ${file.name}`);
@@ -101,17 +161,17 @@ const CollectionDetail = () => {
 
   const { getRootProps, getInputProps, isDragActive } = useDropzone({ onDrop });
 
-  // --- STEP 6: THE ERASER (Atomic Delete) ---
+  // --- 4. THE ERASER ---
   const handleDelete = async (mediaId) => {
     const originalItems = [...mediaItems];
-    setMediaItems(prev => prev.filter(i => i._id !== mediaId)); // Optimistic UI
+    setMediaItems(prev => prev.filter(i => i._id !== mediaId));
 
     try {
-      await api.delete(`/media/delete/${mediaId}/`);
-      toast.success("Item erased from physical vault.");
+      await api.delete(`/media/delete/${mediaId}//`);
+      toast.success("Item erased from vault.");
     } catch (err) {
       toast.error("Erase failed.");
-      setMediaItems(originalItems); // Rollback
+      setMediaItems(originalItems);
     }
   };
 
