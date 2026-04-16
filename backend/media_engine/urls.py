@@ -10,20 +10,21 @@ from .views import (
     get_media_batch_status,
     retry_embedding,
     get_embedding_info,
-    delete_media_item 
+    list_collection_media,  
 )
 
-
 urlpatterns = [
-    path('register/', register_user, name='register'),
-    path('login/', login_user, name='login'),
-    path('collections/', list_collections, name='list_collections'),
-    path('collections/create/', create_collection, name='create_collection'),
-    path('media/upload/', upload_media, name='upload_media'),
-    path('media/file/<str:media_id>/', serve_media_file, name='serve_file'),
-    path('media/delete/<str:media_id>/', delete_media_item, name='delete_file'),
+    path('register/', register_user),
+    path('login/', login_user),
     
-    path('media/status/', get_media_batch_status, name='batch_status'),
-    path('media/retry/<str:media_id>/', retry_embedding, name='retry_embedding'),
-    path('media/info/<str:media_id>/', get_embedding_info, name='embedding_info'),
+    path('collections/', list_collections),
+    path('collections/create/', create_collection),
+    path('collections/<str:collection_id>/media/', list_collection_media),      
+    path('media/upload/', upload_media),
+    path('media/file/<str:media_id>/', serve_media_file),
+    path('media/delete/<str:media_id>/', delete_media_item),
+    path('media/status/', get_media_batch_status),
+    path('media/retry/<str:media_id>/', retry_embedding),
+    path('media/info/<str:media_id>/', get_embedding_info),
+    
 ]

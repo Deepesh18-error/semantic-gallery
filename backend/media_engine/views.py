@@ -15,6 +15,35 @@ from .auth_service import hash_password, verify_password, create_token , token_r
 from .utils import validate_file
 from .embedding_tasks import start_background_embedding
 from .pinecone_service import get_pinecone_index
+# Add at the top of views.py
+from bson import ObjectId
+import json
+
+class MongoJSONEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, datetime):
+            return obj.isoformat()
+        if isinstance(obj, ObjectId):
+            return str(obj)
+        return super().default(obj)
+
+def serialize_doc(doc):
+    """Converts a MongoDB document to JSON-safe dict."""
+    if doc is None:
+        return None
+    result = {}
+    for key, value in doc.items():
+        if isinstance(value, datetime):
+            result[key] = value.isoformat()
+        elif isinstance(value, ObjectId):
+            result[key] = str(value)
+        elif isinstance(value, dict):
+            result[key] = serialize_doc(value)
+        elif isinstance(value, list):
+            result[key] = [serialize_doc(i) if isinstance(i, dict) else str(i) if isinstance(i, ObjectId) else i for i in value]
+        else:
+            result[key] = value
+    return result
 
 
 @api_view(['POST'])
@@ -208,31 +237,39 @@ def upload_media(request):
 @token_required
 def serve_media_file(request, media_id):
     item = db.media_items.find_one({"_id": media_id})
-    if not item: 
-        print(f"❌ View: ID {media_id} not found in MongoDB.")
+    if not item:
         return HttpResponse(status=404)
 
     is_thumbnail = request.GET.get('thumbnail') == 'true'
+    media_type = item.get('media_type', '')
 
     if is_thumbnail:
-        # Check exactly where the path is stored
-        file_path = item.get('file_metadata', {}).get('thumbnail_path')
-        print(f"🔍 View: Searching for thumbnail for {media_id}")
-        print(f"📂 View: Path from DB is -> {file_path}")
-        content_type = 'image/jpeg'
+        if media_type == 'IMAGE':
+            # Images: serve the actual file as its own preview
+            file_path = item.get('file_path')
+            content_type = item.get('file_metadata', {}).get('mime_type', 'image/jpeg')
+
+        elif media_type in ['VIDEO', 'DOCUMENT']:
+            # Videos and PDFs: serve the generated JPG thumbnail
+            file_path = item.get('file_metadata', {}).get('thumbnail_path')
+            content_type = 'image/jpeg'
+            if not file_path:
+                print(f"❌ No thumbnail generated yet for {media_type} {media_id}")
+                return HttpResponse(status=404)
+        else:
+            # AUDIO, TEXT — no visual thumbnail
+            return HttpResponse(status=404)
     else:
         file_path = item.get('file_path')
-        content_type = item.get('file_metadata', {}).get('mime_type')
+        content_type = item.get('file_metadata', {}).get('mime_type', 'application/octet-stream')
 
     if not file_path:
-        print(f"❌ View: The 'thumbnail_path' field is EMPTY in MongoDB for this item.")
         return HttpResponse(status=404)
 
     if not os.path.exists(file_path):
-        print(f"❌ View: Physical file NOT FOUND on disk at: {file_path}")
+        print(f"❌ Physical file not found: {file_path}")
         return HttpResponse(status=404)
 
-    print(f"✅ View: Serving file successfully!")
     return FileResponse(open(file_path, 'rb'), content_type=content_type)
 
 
@@ -398,3 +435,22 @@ def delete_media_item(request, media_id):
 
     return Response({"message": "Fully erased."})
 
+
+@api_view(['GET'])
+@token_required
+def list_collection_media(request, collection_id):
+    collection = db.collections.find_one({
+        "_id": collection_id,
+        "user_id": request.user_id
+    })
+    if not collection:
+        return Response({"error": "Collection not found"}, status=404)
+
+    items = list(db.media_items.find(
+        {"collection_id": collection_id, "user_id": request.user_id},
+        sort=[("created_at", -1)]
+    ))
+    
+    # Serialize all MongoDB docs to JSON-safe format
+    safe_items = [serialize_doc(item) for item in items]
+    return Response(safe_items)

@@ -15,8 +15,16 @@ const SmartMediaPreview = ({ mediaId, mediaType, processingStatus }) => {
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    // Don't attempt thumbnail fetch until the AI pipeline is DONE
-    // This is the key fix — no point hitting the server before the thumbnail exists
+    // Only these three types have visual previews
+    const PREVIEWABLE = ['IMAGE', 'VIDEO', 'DOCUMENT'];
+
+    if (!PREVIEWABLE.includes(mediaType)) {
+      setLoading(false);
+      return;
+    }
+
+    // Don't fetch until AI pipeline is fully done
+    // This prevents 404s on thumbnails that haven't been generated yet
     if (processingStatus !== 'EMBEDDED') {
       setLoading(false);
       return;
@@ -26,49 +34,53 @@ const SmartMediaPreview = ({ mediaId, mediaType, processingStatus }) => {
 
     const fetchPreview = async () => {
       try {
-        const response = await api.get(`/media/file/${mediaId}/?thumbnail=true`, { 
-          responseType: 'blob' 
-        });
+        // IMAGE  → serve the actual image file directly (no thumbnail needed)
+        // VIDEO  → serve the generated JPG thumbnail from media_vault/thumbnails/
+        // DOCUMENT (PDF) → serve the generated JPG thumbnail from media_vault/thumbnails/
+        const url = mediaType === 'IMAGE'
+          ? `/media/file/${mediaId}/`
+          : `/media/file/${mediaId}/?thumbnail=true`;
+
+        const response = await api.get(url, { responseType: 'blob' });
         objectUrl = URL.createObjectURL(response.data);
         setImgUrl(objectUrl);
-      } catch (err) { 
-        console.warn(`Preview not ready for ${mediaId}`); 
-      } finally { 
-        setLoading(false); 
+      } catch (err) {
+        console.warn(`Preview fetch failed for ${mediaId}:`, err.response?.status);
+      } finally {
+        setLoading(false);
       }
     };
 
     fetchPreview();
 
-    // Cleanup the blob URL when the component unmounts to avoid memory leaks
     return () => {
       if (objectUrl) URL.revokeObjectURL(objectUrl);
     };
-  }, [mediaId, processingStatus]); // Re-run when status changes to EMBEDDED
+  }, [mediaId, mediaType, processingStatus]); // Re-runs when status flips to EMBEDDED
 
   if (loading) return (
     <div className="w-full h-full bg-slate-50 animate-pulse flex items-center justify-center">
       <Loader2 className="animate-spin text-slate-200 w-8 h-8" />
     </div>
   );
-  
+
   if (!imgUrl) return (
     <div className="flex flex-col items-center gap-3 text-slate-300">
-      {mediaType === 'VIDEO' 
-        ? <Video className="w-16 h-16 opacity-30" /> 
-        : <ImageIcon className="w-16 h-16 opacity-30" />
-      }
+      {mediaType === 'VIDEO' && <Video className="w-16 h-16 opacity-30" />}
+      {mediaType === 'DOCUMENT' && <FileText className="w-16 h-16 opacity-30" />}
+      {mediaType === 'IMAGE' && <ImageIcon className="w-16 h-16 opacity-30" />}
+      {mediaType === 'AUDIO' && <Music className="w-16 h-16 opacity-30" />}
       <span className="text-[9px] font-black uppercase tracking-widest bg-slate-100 px-3 py-1 rounded-full text-slate-400">
-        No Preview
+        {mediaType === 'AUDIO' ? 'AUDIO FILE' : 'NO PREVIEW'}
       </span>
     </div>
   );
 
   return (
-    <img 
-      src={imgUrl} 
-      alt="Vault Media" 
-      className="w-full h-full object-cover group-hover:scale-110 transition-transform duration-700" 
+    <img
+      src={imgUrl}
+      alt="Vault Media"
+      className="w-full h-full object-cover group-hover:scale-110 transition-transform duration-700"
     />
   );
 };
@@ -195,40 +207,47 @@ const CollectionDetail = () => {
   const pollingInterval = useRef(null); // Ref to manage the timer cleanly
 
   // --- 1. INITIAL DATA FETCH & BOOTSTRAP POLLING ---
-  useEffect(() => {
-    const fetchVaultData = async () => {
-      try {
-        setLoading(true);
-        // Fetch Collection Info
-        const colRes = await api.get('/collections/');
-        const found = colRes.data.find(c => c._id === collectionId);
-        if (!found) return navigate('/');
-        setCollection(found);
+useEffect(() => {
+  const fetchVaultData = async () => {
+    try {
+      setLoading(true);
 
-        // Fetch Items (Using the collections endpoint for now as per your code)
-        // In the future, this should be: api.get(`/collections/${collectionId}/media/`)
-        const mediaRes = await api.get('/collections/'); 
-        const items = mediaRes.data; // Filter these as needed based on your DB structure
-        setMediaItems(items);
+      // Step 1: Fetch collection info (to get name, color, etc.)
+      const colRes = await api.get('/collections/');
+      const found = colRes.data.find(c => c._id === collectionId);
+      if (!found) return navigate('/');
+      setCollection(found);
 
-        // 🧠 BOOTSTRAP: If any items are already PENDING in DB, add them to polling queue
-        const unfinished = items
-          .filter(i => i.processing_status === 'PENDING' || i.processing_status === 'PROCESSING')
-          .map(i => i._id);
-        
-        if (unfinished.length > 0) {
-            setPendingIds(unfinished);
-        }
+      // Step 2: Fetch ACTUAL media items for THIS collection
+      // This was the critical bug — it was calling /collections/ again
+      const mediaRes = await api.get(`/collections/${collectionId}/media/`);
+      const items = mediaRes.data;
+      setMediaItems(items);
 
-      } catch (err) {
-        toast.error("Vault access denied.");
-      } finally {
-        setLoading(false);
+      // Step 3: Bootstrap polling — resume tracking any unfinished items
+      // This ensures that if you refresh mid-processing, it picks up where it left off
+      const unfinished = items
+        .filter(i =>
+          i.processing_status === 'PENDING' ||
+          i.processing_status === 'PROCESSING'
+        )
+        .map(i => i._id);
+
+      if (unfinished.length > 0) {
+        console.log(`🔄 Resuming polling for ${unfinished.length} unfinished items`);
+        setPendingIds(unfinished);
       }
-    };
-    fetchVaultData();
-  }, [collectionId, navigate]);
 
+    } catch (err) {
+      console.error("Vault fetch error:", err);
+      toast.error("Failed to load vault contents.");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  fetchVaultData();
+}, [collectionId, navigate]);
 
   // --- 2. THE HEARTBEAT ENGINE (Phase 3 Section 1) ---
   useEffect(() => {
@@ -471,16 +490,11 @@ const CollectionDetail = () => {
                   {/* PREVIEW AREA */}
                   <div className={`aspect-[4/5] bg-slate-50 relative overflow-hidden flex items-center justify-center ${!isEmbedded ? 'grayscale' : ''}`}>
                     
-                    { (item.media_type === 'IMAGE' || item.media_type === 'VIDEO') ? (
-                      <SmartMediaPreview mediaId={item._id} mediaType={item.media_type} processingStatus={item.processing_status}  />
-                    ) : (
-                      <div className="flex flex-col items-center gap-3 text-slate-300">
-                        <FileText className="w-16 h-16 opacity-30" />
-                        <span className="text-[10px] font-black uppercase tracking-widest bg-slate-100 px-3 py-1 rounded-full text-slate-400">
-                          {item.media_type}
-                        </span>
-                      </div>
-                    )}
+                    <SmartMediaPreview
+                      mediaId={item._id}
+                      mediaType={item.media_type}
+                      processingStatus={item.processing_status}
+                    />
 
                     {/* SHIMMER EFFECT (Section 2) */}
                     {isProcessing && <ShimmerOverlay />}
