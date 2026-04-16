@@ -58,3 +58,25 @@ def upsert_to_pinecone(vector, package, media_id, user_id, collection_id, filena
     except Exception as e:
         print(f"    ❌ [PINECONE INTERNAL] Upsert FAILED: {str(e)}")
         raise e
+    
+def upsert_batch_to_pinecone(vector_data_list):
+    """
+    vector_data_list: List of dicts containing {id, vector, metadata}
+    """
+    index = get_pinecone_index()
+    
+    # Format for Pinecone: [(id, vector, metadata), ...]
+    formatted_data = [
+        (item['id'], item['vector'], item['metadata']) 
+        for item in vector_data_list
+    ]
+
+    upsert_start = time.time()
+    try:
+        # One single network call for all chunks!
+        index.upsert(vectors=formatted_data)
+        print(f"🌲 [PINECONE] Batch Upsert of {len(formatted_data)} items SUCCESS ({time.time() - upsert_start:.3f}s)")
+    except Exception as e:
+        print(f"❌ [PINECONE] Batch Upsert FAILED: {str(e)}")
+        raise e
+    

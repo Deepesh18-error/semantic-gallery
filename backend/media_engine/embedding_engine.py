@@ -1,9 +1,14 @@
 import time
+import threading
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor
 from .database import db
 from .preprocessor import process_media_item
 from .gemini_service import get_embedding, EmbeddingFailedError
-from .pinecone_service import upsert_to_pinecone
+from .pinecone_service import upsert_batch_to_pinecone
+
+# 🛡️ THE SAFETY GATE: Respect Gemini's 10 RPM limit
+gemini_semaphore = threading.Semaphore(5)
 
 def run_embedding_pipeline(media_id):
     item = db.media_items.find_one({"_id": media_id})
@@ -12,124 +17,126 @@ def run_embedding_pipeline(media_id):
         return
 
     filename = item['file_metadata']['original_name']
-    
-    # ⏱️ MASTER TIMER START
     pipeline_start = time.time()
+    
     print(f"\n{'='*60}")
-    print(f"⏱️  PIPELINE START: {filename}")
+    print(f"🚀 TURBO PIPELINE START: {filename}")
     print(f"⏱️  Start Time: {datetime.utcnow().strftime('%H:%M:%S.%f')}")
     print(f"{'='*60}")
 
     try:
-        db.media_items.update_one(
-            {"_id": media_id},
-            {"$set": {
-                "processing_status": "PROCESSING",
-                "embedding_started_at": datetime.utcnow()
-            }}
-        )
+        db.media_items.update_one({"_id": media_id}, {"$set": {"processing_status": "PROCESSING"}})
 
-        # ⏱️ STAGE 1: PREPROCESSING
+        # STAGE 1: PREPROCESSING
         stage1_start = time.time()
-        print(f"\n📦 [STAGE 1] Preprocessing started...")
-        
         packages = process_media_item(media_id)
-        
         stage1_end = time.time()
-        print(f"📦 [STAGE 1] Preprocessing DONE")
-        print(f"📦 [STAGE 1] Packages generated: {len(packages)}")
-        print(f"📦 [STAGE 1] Time taken: {stage1_end - stage1_start:.3f}s")
-
-        if not packages:
-            raise ValueError("Preprocessor returned no data packages.")
-
-        vector_ids_list = []
-        total_count = len(packages)
-
-        # ⏱️ STAGE 2+3: GEMINI + PINECONE per package
-        for idx, package in enumerate(packages):
-            print(f"\n  --- Package {idx + 1}/{total_count} | Type: {package['type']} ---")
-
-            # ⏱️ GEMINI CALL
-            gemini_start = time.time()
-            print(f"  🤖 [GEMINI]   Request sent at: {datetime.utcnow().strftime('%H:%M:%S.%f')}")
-            
-            vector = get_embedding(package)
-            
-            gemini_end = time.time()
-            print(f"  🤖 [GEMINI]   Response received at: {datetime.utcnow().strftime('%H:%M:%S.%f')}")
-            print(f"  🤖 [GEMINI]   Time taken: {gemini_end - gemini_start:.3f}s")
-            print(f"  🤖 [GEMINI]   Vector dimensions: {len(vector)}")
-
-            # ⏱️ PINECONE UPSERT
-            pinecone_start = time.time()
-            print(f"  🌲 [PINECONE] Upsert started at: {datetime.utcnow().strftime('%H:%M:%S.%f')}")
-            
-            v_id = upsert_to_pinecone(
-                vector=vector,
-                package=package,
-                media_id=media_id,
-                user_id=item['user_id'],
-                collection_id=item['collection_id'],
-                filename=filename
-            )
-            
-            pinecone_end = time.time()
-            print(f"  🌲 [PINECONE] Upsert done at: {datetime.utcnow().strftime('%H:%M:%S.%f')}")
-            print(f"  🌲 [PINECONE] Time taken: {pinecone_end - pinecone_start:.3f}s")
-            print(f"  🌲 [PINECONE] Vector ID: {v_id}")
-
-            vector_ids_list.append(v_id)
-
-        # ⏱️ STAGE 4: MONGODB STATUS UPDATE
-        mongo_start = time.time()
-        print(f"\n💾 [MONGODB]  Status update started...")
         
+        if not packages:
+            raise ValueError("Preprocessor returned no packages.")
+
+        # STAGE 2: PARALLEL GEMINI
+        stage2_start = time.time()
+        all_worker_responses = []
+
+        def gemini_worker(package):
+            # 1. Identify index safely
+            m_data = package.get('metadata', {})
+            p_idx = m_data.get('chunk_index', 0) or m_data.get('segment_index', 0)
+            p_type = package['type']
+            
+            try:
+                with gemini_semaphore:
+                    # 2. Network Call
+                    vector = get_embedding(package)
+                    
+                    # 3. Build Unique ID (FIXED: using m_data defined above)
+                    v_id = str(media_id)
+                    if p_type == "TEXT": 
+                        v_id += f"_chunk_{p_idx}"
+                    else:
+                        v_id += f"_segment_{p_idx}"
+
+                    # 4. Build Metadata
+                    pinecone_metadata = {
+                        "user_id": str(item['user_id']),
+                        "collection_id": str(item['collection_id']),
+                        "media_item_id": str(media_id),
+                        "file_type": p_type,
+                        "original_filename": filename,
+                    }
+                    
+                    if p_type == "TEXT":
+                        pinecone_metadata["chunk_text"] = package['data'][:1000]
+                    else:
+                        pinecone_metadata["start_time"] = float(m_data.get('start_time', 0.0))
+                        pinecone_metadata["end_time"] = float(m_data.get('end_time', 0.0))
+
+                    return {"status": "SUCCESS", "data": {"id": v_id, "vector": vector, "metadata": pinecone_metadata}}
+            
+            except Exception as e:
+                return {"status": "FAILED", "chunk_index": p_idx, "error": str(e)}
+
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            all_worker_responses = list(executor.map(gemini_worker, packages))
+
+        stage2_end = time.time()
+
+        # STAGE 3: BATCH PINECONE
+        stage3_start = time.time()
+        successful_results = [r['data'] for r in all_worker_responses if r['status'] == "SUCCESS"]
+        failed_chunks = [r['chunk_index'] for r in all_worker_responses if r['status'] == "FAILED"]
+
+        if successful_results:
+            upsert_batch_to_pinecone(successful_results)
+            stage3_end = time.time()
+        else:
+            stage3_end = stage3_start
+
+        # STAGE 4: MONGODB SYNC
+        mongo_start = time.time()
+        final_status = "EMBEDDED"
+        error_msg = None
+        
+        if not successful_results:
+            final_status = "FAILED"
+            # Get the first error we found to show in UI
+            error_msg = all_worker_responses[0].get('error', "AI calls failed.")
+        elif failed_chunks:
+            final_status = "PARTIALLY_EMBEDDED"
+            error_msg = f"Incomplete: {len(failed_chunks)} chunks failed."
+
         db.media_items.update_one(
             {"_id": media_id},
             {"$set": {
-                "processing_status": "EMBEDDED",
-                "total_vectors": total_count,
-                "vector_ids": vector_ids_list,
+                "processing_status": final_status,
+                "total_vectors": len(successful_results),
+                "vector_ids": [r['id'] for r in successful_results],
+                "failed_chunks": failed_chunks,
+                "error_message": error_msg,
                 "embedding_ended_at": datetime.utcnow()
             }}
         )
-        
         mongo_end = time.time()
-        print(f"💾 [MONGODB]  Status update done")
-        print(f"💾 [MONGODB]  Time taken: {mongo_end - mongo_start:.3f}s")
 
-        # ⏱️ MASTER TIMER END
-        pipeline_end = time.time()
-        total_time = pipeline_end - pipeline_start
-        
+        # RECAP LOGS
+        total_time = time.time() - pipeline_start
         print(f"\n{'='*60}")
-        print(f"✅ PIPELINE COMPLETE: {filename}")
+        print(f"✅ PIPELINE FINISHED: {filename}")
         print(f"{'='*60}")
-        print(f"  📦 Preprocessing:    {stage1_end - stage1_start:.3f}s")
-        
-        # Per-package breakdown
-        gemini_total = sum([0])  # We'll add this below
-        pinecone_total = sum([0])
-        
-        print(f"  🤖 Gemini API:       (see per-package logs above)")
-        print(f"  🌲 Pinecone:         (see per-package logs above)")
-        print(f"  💾 MongoDB Update:   {mongo_end - mongo_start:.3f}s")
-        print(f"  ⏱️  TOTAL TIME:       {total_time:.3f}s ({total_time/60:.2f} min)")
+        print(f"  📦 Stage 1 (Preprocess):   {stage1_end - stage1_start:.3f}s")
+        print(f"  🤖 Stage 2 (Gemini Par):   {stage2_end - stage2_start:.3f}s")
+        print(f"  🌲 Stage 3 (Pinecone Bat): {stage3_end - stage3_start:.3f}s")
+        print(f"  💾 Stage 4 (Mongo Sync):   {mongo_end - mongo_start:.3f}s")
+        print(f"  📊 Final Status:           {final_status}")
+        print(f"  ⏱️  TOTAL LATENCY:         {total_time:.3f}s")
         print(f"{'='*60}\n")
 
-    except EmbeddingFailedError as e:
-        pipeline_end = time.time()
-        print(f"❌ PIPELINE FAILED at {time.time() - pipeline_start:.3f}s: AI Error: {str(e)}")
-        _handle_failure(media_id, f"AI Error: {str(e)}")
     except Exception as e:
-        pipeline_end = time.time()
-        print(f"❌ PIPELINE FAILED at {time.time() - pipeline_start:.3f}s: System Error: {str(e)}")
-        _handle_failure(media_id, f"System Error: {str(e)}")
+        _handle_failure(media_id, str(e))
 
 
 def _handle_failure(media_id, error_msg):
-    print(f"❌ Engine Failure for {media_id}: {error_msg}")
     db.media_items.update_one(
         {"_id": media_id},
         {"$set": {

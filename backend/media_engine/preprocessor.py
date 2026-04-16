@@ -14,9 +14,9 @@ from datetime import datetime
 logger = logging.getLogger(__name__)
 
 
-# ============================================================
+
 # THUMBNAIL GENERATOR (VIDEO)
-# ============================================================
+
 def generate_video_thumbnail(video_path, media_id):
     start = time.time()
     print(f"    ⏱️  [PREPROCESS] VIDEO THUMBNAIL: FFmpeg extraction starting...")
@@ -47,9 +47,9 @@ def generate_video_thumbnail(video_path, media_id):
         return None
 
 
-# ============================================================
+
 # THUMBNAIL GENERATOR (PDF) — Uses PyMuPDF, already installed
-# ============================================================
+
 def generate_pdf_thumbnail(pdf_path, media_id):
     start = time.time()
     print(f"    ⏱️  [PREPROCESS] PDF THUMBNAIL: PyMuPDF rendering page 1...")
@@ -170,9 +170,9 @@ def generate_text_thumbnail(path, media_id, ext):
 
 
 
-# ============================================================
+
 # MAIN DISPATCHER — THIS WAS THE BROKEN FUNCTION
-# ============================================================
+
 def process_media_item(media_id):
     item = db.media_items.find_one({"_id": media_id})
     if not item:
@@ -226,9 +226,9 @@ def process_media_item(media_id):
     return []
 
 
-# ============================================================
+
 # IMAGE PROCESSOR
-# ============================================================
+
 def _process_image(path):
     start = time.time()
     print(f"    ⏱️  [PREPROCESS] IMAGE: reading + resizing + base64 encoding...")
@@ -244,81 +244,100 @@ def _process_image(path):
     return [{"type": "IMAGE", "data": b64, "metadata": {"chunk_index": 0}}]
 
 
-# ============================================================
+
 # DOCUMENT PROCESSOR — Fixed edge cases
-# ============================================================
+
 def _process_document(path):
     import time
     start = time.time()
     ext = os.path.splitext(path)[1].lower()
-    print(f"    ⏱️  [PREPROCESS] DOCUMENT ({ext}): extracting text...")
-
-    # Step 1: Extract text — ALL variables initialized before try block
+    
+    # 1. THE EXTRACTION PHASE (Distinct logic per type)
     text_content = ""
+    print(f"    ⏱️  [PREPROCESS] Document Extraction: {ext}")
 
     try:
         if ext == '.pdf':
+            # PyMuPDF is extremely fast for text extraction
             doc = fitz.open(path)
             text_content = " ".join([page.get_text() for page in doc])
             doc.close()
 
         elif ext == '.docx':
+            # Uses python-docx to extract paragraph text
             doc = DocxDocument(path)
-            text_content = " ".join([
-                p.text for p in doc.paragraphs if p.text.strip()
-            ])
+            text_content = " ".join([p.text for p in doc.paragraphs if p.text.strip()])
 
         elif ext in ['.txt', '.md']:
+            # Standard text files
             with open(path, 'r', encoding='utf-8', errors='ignore') as f:
                 text_content = f.read()
 
         else:
-            # Fallback — try reading as plain text
+            # Fallback for unknown text-based extensions
             with open(path, 'r', encoding='utf-8', errors='ignore') as f:
                 text_content = f.read()
 
     except Exception as e:
-        print(f"    ❌ [PREPROCESS] Text extraction crashed: {str(e)}")
-        # Return placeholder so pipeline doesn't fail completely
+        print(f"    ❌ [PREPROCESS] Extraction Failed: {str(e)}")
+        # Return a single 'Fail' package so the pipeline doesn't crash
         return [{
-            "type": "TEXT",
-            "data": f"Document: {os.path.basename(path)}",
-            "metadata": {
-                "chunk_index": 0,
-                "chunk_text": "Text extraction failed for this document."
-            }
+            "type": "TEXT", 
+            "data": f"Extraction failed for {os.path.basename(path)}", 
+            "metadata": {"chunk_index": 0, "chunk_text": "Error during text extraction."}
         }]
 
-    # Step 2: Clean and validate — OUTSIDE try block, text_content guaranteed to exist
+    # 2. CLEANING & VALIDATION
     text_content = text_content.strip()
-
-    extract_time = time.time() - start
-    
     if not text_content:
-        print(f"    ⚠️  [PREPROCESS] Empty document — no extractable text ({extract_time:.3f}s)")
+        print(f"    ⚠️  [PREPROCESS] Empty content detected after extraction.")
         return [{
-            "type": "TEXT",
-            "data": f"Document file: {os.path.basename(path)}",
-            "metadata": {
-                "chunk_index": 0,
-                "chunk_text": "No text content extractable from this document."
-            }
+            "type": "TEXT", 
+            "data": f"Empty file: {os.path.basename(path)}", 
+            "metadata": {"chunk_index": 0, "chunk_text": "No text content found."}
         }]
 
-    # Step 3: Chunking — words defined here, guaranteed text_content exists
+    # 3. THE OPTIMIZED CHUNKING PHASE (Universal logic for all text)
+    # Target: ~6000 tokens (approx 4500 words)
+    # Overlap: 0 (No redundancy for speed)
     words = text_content.split()
-    print(f"    ⏱️  [PREPROCESS] Text extracted in {extract_time:.3f}s | Words: {len(words)}")
+    CHUNK_SIZE_WORDS = 4500 
+    packages = []
 
-    chunk_size = 500
-    overlap = 50
-    chunks = []
-    chunk_start = time.time()
-
-    i = 0
-    while i < len(words):
-        chunk_words = words[i : i + chunk_size]
+    # Using range with a step for the fastest Pythonic slicing
+    for i in range(0, len(words), CHUNK_SIZE_WORDS):
+        chunk_words = words[i : i + CHUNK_SIZE_WORDS]
         chunk_text = " ".join(chunk_words)
 
+        packages.append({
+            "type": "TEXT",
+            "data": chunk_text,
+            "metadata": {
+                "chunk_index": len(packages),
+                "chunk_text": chunk_text[:200] # Safe preview for UI
+            }
+        })
+
+    extraction_time = time.time() - start
+    print(f"    ✅ [PREPROCESS] Document DONE: {len(words)} words -> {len(packages)} chunks in {extraction_time:.3f}s")
+    
+    return packages
+
+
+
+# TEXT CONTENT PROCESSOR (for plain text notes)
+
+def _process_text_content(text_content):
+    if not text_content or not text_content.strip():
+        return []
+
+    words = text_content.split()
+    CHUNK_SIZE_WORDS = 5000 
+    chunks = []
+
+    for i in range(0, len(words), CHUNK_SIZE_WORDS):
+        chunk_words = words[i : i + CHUNK_SIZE_WORDS]
+        chunk_text = " ".join(chunk_words)
         chunks.append({
             "type": "TEXT",
             "data": chunk_text,
@@ -327,38 +346,11 @@ def _process_document(path):
                 "chunk_text": chunk_text[:200]
             }
         })
-
-        # If this chunk reached the end of words, stop
-        if i + chunk_size >= len(words):
-            break
-
-        i += (chunk_size - overlap)
-
-    print(f"    ⏱️  [PREPROCESS] Chunking done in {time.time() - chunk_start:.3f}s | Chunks: {len(chunks)}")
     return chunks
 
 
-
-# ============================================================
-# TEXT CONTENT PROCESSOR (for plain text notes)
-# ============================================================
-def _process_text_content(text_content):
-    if not text_content or not text_content.strip():
-        return []
-
-    return [{
-        "type": "TEXT",
-        "data": text_content,
-        "metadata": {
-            "chunk_index": 0,
-            "chunk_text": text_content[:200]
-        }
-    }]
-
-
-# ============================================================
 # MULTIMEDIA PROCESSOR (VIDEO / AUDIO segments)
-# ============================================================
+
 def _process_multimedia(path, media_id, is_video):
     segments = split_media(path, media_id, is_video)
     packages = []
