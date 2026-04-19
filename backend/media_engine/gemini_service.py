@@ -94,3 +94,53 @@ def get_embedding(package):
                 raise EmbeddingFailedError(f"Gemini API failed: {str(e)}")
 
     return None
+
+def get_query_embedding(text_query):
+    """
+    Uses task_type="RETRIEVAL_QUERY" to match against stored documents.
+    """
+    
+    api_key = os.getenv("GOOGLE_API_KEY")
+    if not api_key:
+        raise ValueError("GOOGLE_API_KEY is missing from .env")
+
+    client = genai.Client(api_key=api_key)
+    
+    max_retries = 3
+    attempt = 0
+
+    while attempt < max_retries:
+        try:
+            # ⏱️ LOGGING START
+            payload_start = time.time()
+            print(f"    🔍 [SEARCH ENGINE] Embedding Query: '{text_query[:50]}...'")
+
+            # ⏱️ ACTUAL NETWORK CALL
+            api_call_start = time.time()
+            
+            response = client.models.embed_content(
+                model="gemini-embedding-2-preview",
+                contents=text_query,
+                config=types.EmbedContentConfig(
+                    task_type="RETRIEVAL_QUERY", 
+                    output_dimensionality=3072
+                )
+            )
+
+            api_call_end = time.time()
+            vector = response.embeddings[0].values
+            
+            print(f"    ✅ [SEARCH ENGINE] Query Vectorized in {api_call_end - payload_start:.3f}s")
+            return vector
+
+        except Exception as e:
+            attempt += 1
+            print(f"    ⚠️ [SEARCH ENGINE] Query Attempt {attempt} FAILED: {str(e)}")
+
+            if attempt < max_retries:
+                wait = 1 * attempt 
+                time.sleep(wait)
+            else:
+                raise EmbeddingFailedError(f"Gemini Search API failed: {str(e)}")
+
+    return None

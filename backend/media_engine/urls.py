@@ -11,11 +11,18 @@ from .views import (
     retry_embedding,
     get_embedding_info,
     list_collection_media,  
+    search_media,         
+    get_search_history,
 )
 
 urlpatterns = [
+    
+    path('search/', search_media),
+    path('search/history/', get_search_history),
+
     path('register/', register_user),
     path('login/', login_user),
+    
     
     path('collections/', list_collections),
     path('collections/create/', create_collection),

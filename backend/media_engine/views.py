@@ -18,6 +18,8 @@ from .pinecone_service import get_pinecone_index
 # Add at the top of views.py
 from bson import ObjectId
 import json
+from .search_service import execute_search
+
 
 class MongoJSONEncoder(json.JSONEncoder):
     def default(self, obj):
@@ -454,3 +456,59 @@ def list_collection_media(request, collection_id):
     # Serialize all MongoDB docs to JSON-safe format
     safe_items = [serialize_doc(item) for item in items]
     return Response(safe_items)
+
+@api_view(['POST'])
+@token_required
+def search_media(request):
+    """
+    Entry point for the Multimodal Search.
+    Payload: { "query": "burger photo", "collection_id": "uuid", "file_type": "IMAGE", "limit": 10 }
+    """
+    data = request.data
+    query_text = data.get('query', '').strip()
+    
+    # 1. Validation: Don't waste Gemini API credits on empty strings
+    if not query_text:
+        return Response({"error": "Search query cannot be empty"}, status=status.HTTP_400_BAD_REQUEST)
+
+    # 2. Extract optional filters
+    collection_id = data.get('collection_id') # Can be None
+    file_type = data.get('file_type')         # Can be None or "ALL"
+    limit = data.get('limit', 10)             # Default to 10
+
+    print(f"📡 [API] Search request from User {request.user_id}: '{query_text}'")
+
+    # 3. Call the search brain
+    search_results = execute_search(
+        user_id=request.user_id,
+        query_text=query_text,
+        collection_id=collection_id,
+        file_type=file_type,
+        limit=limit
+    )
+
+    # 4. Handle internal errors
+    if "error" in search_results:
+        return Response(search_results, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    return Response(search_results, status=status.HTTP_200_OK)
+
+
+@api_view(['GET'])
+@token_required
+def get_search_history(request):
+    """
+    Returns the user's recent search analytics.
+    Sorted by most recent first.
+    """
+    # 1. Query MongoDB search_history collection
+    # We fetch the last 20 searches for this specific user
+    history = list(db.search_history.find(
+        {"user_id": request.user_id},
+        {"user_id": 0} # Don't need to send the user_id back to the user
+    ).sort("searched_at", -1).limit(20))
+
+    # 2. Use your existing serialize_doc helper to make it JSON-safe
+    safe_history = [serialize_doc(h) for h in history]
+    
+    return Response(safe_history, status=status.HTTP_200_OK)
