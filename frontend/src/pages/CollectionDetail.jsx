@@ -4,7 +4,7 @@ import { useDropzone } from 'react-dropzone';
 import { motion, AnimatePresence } from 'framer-motion';
 import { 
   ArrowLeft, Upload, File, Image as ImageIcon, Video, 
-  Music, Loader2, Trash2, Clock, HardDrive, Play, FileText, MousePointer2, Check, XCircle, RotateCcw, AlertCircle
+  Music, Loader2, Trash2, Clock, HardDrive, Play, FileText, MousePointer2, Check, XCircle, RotateCcw, AlertCircle , Search as SearchIcon
 } from 'lucide-react';
 import api from '../services/api';
 import toast from 'react-hot-toast';
@@ -203,6 +203,8 @@ const CollectionDetail = () => {
   const [pendingIds, setPendingIds] = useState([]);   // Tracks AI progress (Polling Queue)
   const [loading, setLoading] = useState(true);
   const [selectedItem, setSelectedItem] = useState(null);
+  const [localSearch, setLocalSearch] = useState('');
+
 
   const pollingInterval = useRef(null); // Ref to manage the timer cleanly
 
@@ -388,6 +390,11 @@ useEffect(() => {
     }
   };
 
+  const handleHeaderSearch = (e) => {
+  if (e.key === 'Enter' && localSearch.trim()) {
+    navigate(`/search?q=${encodeURIComponent(localSearch)}&collectionId=${collectionId}`);
+  }
+};
 
   if (loading) return (
     <div className="min-h-screen flex items-center justify-center bg-slate-50">
@@ -400,16 +407,28 @@ useEffect(() => {
       
       {/* 1. HEADER SYSTEM */}
       <header className="bg-white border-b border-slate-200 sticky top-0 z-50 px-8 py-5 flex items-center justify-between">
-        <div className="flex items-center gap-5">
+        <div className="flex items-center gap-5 flex-1">
           <Link to="/" className="p-2.5 hover:bg-slate-50 rounded-2xl border border-transparent hover:border-slate-100 transition-all">
             <ArrowLeft className="text-slate-400" />
           </Link>
           <div>
             <h1 className="text-2xl font-black text-slate-900 tracking-tight">{collection?.name}</h1>
             <p className="text-[10px] font-black text-slate-400 uppercase tracking-[0.2em]">
-                {mediaItems.length} Registered Items
+              {mediaItems.length} Registered Items
             </p>
           </div>
+
+              <div className="relative max-w-md w-full ml-4 hidden md:block">
+                <SearchIcon className="absolute left-4 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" />
+                <input
+                  type="text"
+                  value={localSearch}
+                  onChange={(e) => setLocalSearch(e.target.value)}
+                  onKeyDown={handleHeaderSearch}
+                  placeholder={`Search inside ${collection?.name || 'collection'}...`}
+                  className="w-full pl-11 pr-4 py-3 bg-slate-50 border-2 border-transparent rounded-2xl outline-none focus:bg-white focus:border-brand/20 transition-all font-bold text-sm"
+                />
+              </div>
         </div>
         
         {/* Statistics Bar */}
