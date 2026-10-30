@@ -5,14 +5,16 @@ SUPPORTED_TYPES = {
     'IMAGE': ['.jpg', '.jpeg', '.png', '.webp'],
     'VIDEO': ['.mp4', '.mov', '.avi'],
     'AUDIO': ['.mp3', '.wav', '.m4a'],
-    'DOCUMENT': ['.pdf', '.docx', '.txt']
+    'DOCUMENT': ['.pdf', '.docx'],
+    'TEXT': ['.txt']
 }
 
 SIZE_LIMITS = {
     'IMAGE': 50 * 1024 * 1024,   # 50MB
     'VIDEO': 500 * 1024 * 1024,  # 500MB
     'AUDIO': 200 * 1024 * 1024,  # 200MB
-    'DOCUMENT': 100 * 1024 * 1024 # 100MB
+    'DOCUMENT': 100 * 1024 * 1024, # 100MB
+    'TEXT': 100 * 1024 * 1024
 }
 
 def validate_file(file_obj):

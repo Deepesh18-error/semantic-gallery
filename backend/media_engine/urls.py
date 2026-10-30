@@ -1,20 +1,30 @@
 from django.urls import path
-from .views import (
-    register_user, 
-    login_user, 
-    create_collection, 
-    list_collections,
-    upload_media,
-    serve_media_file,
-    delete_media_item,
-    get_media_batch_status,
-    retry_embedding,
-    get_embedding_info,
-    list_collection_media,  
-    search_media,         
-    get_search_history,
-    retry_all_pending
-)
+import os
+
+if os.getenv("SEMANTIC_GALLERY_STORAGE", "legacy").lower() == "desktop":
+    from .desktop_views import (
+        register_user, login_user, create_collection, list_collections,
+        upload_media, serve_media_file, delete_media_item, get_media_batch_status,
+        retry_embedding, get_embedding_info, list_collection_media, search_media,
+        get_search_history, retry_all_pending,
+    )
+else:
+    from .views import (
+        register_user,
+        login_user,
+        create_collection,
+        list_collections,
+        upload_media,
+        serve_media_file,
+        delete_media_item,
+        get_media_batch_status,
+        retry_embedding,
+        get_embedding_info,
+        list_collection_media,
+        search_media,
+        get_search_history,
+        retry_all_pending,
+    )
 
 urlpatterns = [
     

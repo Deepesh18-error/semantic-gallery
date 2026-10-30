@@ -1,0 +1,64 @@
+{
+  "count": 5000,
+  "dimensions": 3072,
+  "queries": 15,
+  "filter": {
+    "source_type": "IMAGE",
+    "collection": "collection-0"
+  },
+  "engines": {
+    "sqlite_exact": {
+      "startup_ms": 2.97,
+      "filtered_query_p50_ms": 52.45,
+      "filtered_query_p95_ms": 72.35,
+      "all_gallery_query_p95_ms": 739.76,
+      "python_peak_memory_bytes": 1431,
+      "disk_bytes": 64176128,
+      "top10_ids": [
+        708,
+        4704,
+        108,
+        1188,
+        2088,
+        4584,
+        1500,
+        2640,
+        2664,
+        1440
+      ],
+      "delete_persists_after_restart": true
+    },
+    "flat_mmap": {
+      "startup_ms": 9.74,
+      "filtered_query_p50_ms": 34.89,
+      "filtered_query_p95_ms": 40.78,
+      "all_gallery_query_p95_ms": 419.34,
+      "python_peak_memory_bytes": 8560,
+      "disk_bytes": 61440000,
+      "top10_ids": [
+        708,
+        4704,
+        108,
+        1188,
+        2088,
+        4584,
+        1500,
+        2640,
+        2664,
+        1440
+      ],
+      "delete_persists_after_restart": false
+    }
+  },
+  "selection_budget": {
+    "filtered_p95_ms": 250,
+    "all_gallery_p95_ms": 750,
+    "required": [
+      "filter",
+      "persistence",
+      "deletion",
+      "Windows"
+    ]
+  },
+  "selected": "sqlite_exact"
+}

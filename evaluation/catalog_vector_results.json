@@ -1,0 +1,9 @@
+{
+  "reference_machine": "Windows desktop, Python 3.13, 2026-10-31",
+  "count": 5000,
+  "dimensions": 3072,
+  "filtered_p50_ms": 134.73,
+  "filtered_p95_ms": 151.32,
+  "all_gallery_p95_ms": 653.04,
+  "note": "Production SQLiteExactVectors query against a temporary migrated catalog; 15 filtered and 5 all-gallery queries; deterministic synthetic normalized vectors. Excludes query embedding, HTTP, and UI. Small p95 samples are indicative only."
+}

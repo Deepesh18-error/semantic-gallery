@@ -10,7 +10,8 @@ class MongoDB:
     def __init__(self):
         self.client = None
         self.db = None
-        self.connect()
+        if os.getenv("SEMANTIC_GALLERY_STORAGE", "legacy").lower() != "desktop":
+            self.connect()
 
     def connect(self):
         try:

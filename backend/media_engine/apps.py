@@ -1,5 +1,7 @@
 from django.apps import AppConfig
 import threading
+import os
+import sys
 
 class MediaEngineConfig(AppConfig):
     name = 'media_engine'
@@ -9,6 +11,11 @@ class MediaEngineConfig(AppConfig):
         Runs once when Django starts.
         Starts the Watchdog AND the Intelligence Worker.
         """
+        if os.getenv("SEMANTIC_GALLERY_STORAGE", "legacy").lower() == "desktop" or (
+            sys.argv and sys.argv[0].endswith("manage.py") and len(sys.argv) > 1
+            and sys.argv[1] != "runserver"
+        ):
+            return
         # 1. Start the Folder Watcher (Already there)
         threading.Thread(target=self.start_watchdog_on_boot, daemon=True).start()
 
