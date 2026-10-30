@@ -1,0 +1,12 @@
+{
+  "query": "food items",
+  "intent": "MIXED",
+  "thresholds": {"IMAGE": 0.4, "DOCUMENT": 0.4},
+  "candidates": [
+    {"filename": "biryani.jpg", "type": "IMAGE", "raw_score": 0.3503},
+    {"filename": "cake.webp", "type": "IMAGE", "raw_score": 0.3121},
+    {"filename": "Assignment_3_23BCS11932.pdf", "type": "DOCUMENT", "raw_score": 0.4766},
+    {"filename": "cloud-exp8.pdf", "type": "DOCUMENT", "raw_score": 0.4489}
+  ],
+  "source": "Recorded Pinecone scores and MIXED gate from the supplied gallery PDF. Offline reproduction, not a live query."
+}

@@ -5,7 +5,7 @@ import {
   Image as ImageIcon, Video, Music, FileText, 
   X, Loader2, Sparkles, History, ArrowRight
 } from 'lucide-react';
-import api from '../services/api';
+import api, { explainApiError } from '../services/api';
 import toast from 'react-hot-toast';
 import { useSearchParams } from 'react-router-dom'; 
 import SearchResultCard from './SearchResultCard'; 
@@ -33,6 +33,7 @@ const Search = () => {
   const [selectedResult, setSelectedResult] = useState(null);
   
   const debounceTimer = useRef(null);
+  const searchStartedAt = useRef(null);
 
   // --- 1. THE SEARCH CORE ---
   const performSearch = useCallback(async (searchQuery, filter) => {
@@ -43,6 +44,7 @@ const Search = () => {
     }
 
     setLoading(true);
+    searchStartedAt.current = performance.now();
     try {
       const response = await api.post('/search/', {
         query: searchQuery,
@@ -56,12 +58,30 @@ const Search = () => {
         count: response.data.total_count,
         time: response.data.search_time_ms
       });
+      console.info('[SEARCH_UI_METRICS]', JSON.stringify({
+        query: searchQuery,
+        request_round_trip_ms: Math.round(performance.now() - searchStartedAt.current),
+        server: response.data.metrics || null
+      }));
     } catch (err) {
-      toast.error("Search failed. Check your API key.");
+      toast.error(explainApiError(err));
     } finally {
       setLoading(false);
     }
   }, []);
+
+  useEffect(() => {
+    if (!loading && searchStartedAt.current !== null) {
+      const frame = requestAnimationFrame(() => {
+        console.info('[SEARCH_UI_METRICS]', JSON.stringify({
+          cards_visible_ms: Math.round(performance.now() - searchStartedAt.current),
+          count: results.length
+        }));
+        searchStartedAt.current = null;
+      });
+      return () => cancelAnimationFrame(frame);
+    }
+  }, [loading, results]);
 
   // --- 2. DEBOUNCE LOGIC (300ms) ---
   useEffect(() => {

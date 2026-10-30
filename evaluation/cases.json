@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "source": "Current gallery PDF, 2026-06-03. Only visually confirmed labels are scored.",
+  "development": [
+    {"id": "food", "query": "food items", "relevant_files": ["biryani.jpg", "cake.webp"], "known_failure": true},
+    {"id": "waterfall", "query": "jogfall green trees", "relevant_files": ["nature-green-3.jpg", "nature-gree-1.jpg"]},
+    {"id": "rocket", "query": "dark rocket launch", "relevant_files": ["dark-rocket-launch.jpg"]},
+    {"id": "computer", "query": "man holding computer", "relevant_files": ["photo6.jpg"]}
+  ],
+  "held_out": [
+    {"id": "bomb", "query": "bomb blast", "relevant_files": ["photo5.jpg"]},
+    {"id": "iam", "query": "Experiment-9 IAM", "relevant_files": ["cloud-exp9.pdf"], "file_type": "DOCUMENT"},
+    {"id": "missing", "query": "purple elephant riding a bicycle", "relevant_files": [], "requires_review": true}
+  ],
+  "extension_cases": [
+    {"id": "aws_vpc", "query": "AWS VPC", "relevant_files": [], "status": "needs_labeled_source"},
+    {"id": "deep_pdf", "query": "topic found only near end of long PDF", "relevant_files": [], "status": "needs_labeled_source"},
+    {"id": "misleading_pdf", "query": "food photo with unrelated PDFs present", "relevant_files": [], "status": "needs_labeled_source"}
+  ]
+}

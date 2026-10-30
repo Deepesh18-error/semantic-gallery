@@ -28,6 +28,7 @@ const SearchResultCard = ({ result, onClick }) => {
 
     let objectUrl = null;
     const fetchThumb = async () => {
+      const previewStarted = performance.now();
       try {
         const url = result.media_type === 'IMAGE' 
           ? `/media/file/${result.media_item_id}/` 
@@ -36,6 +37,10 @@ const SearchResultCard = ({ result, onClick }) => {
         const res = await api.get(url, { responseType: 'blob' });
         objectUrl = URL.createObjectURL(res.data);
         setThumbUrl(objectUrl);
+        console.info('[SEARCH_UI_METRICS]', JSON.stringify({
+          preview_id: result.media_item_id,
+          preview_fetch_ms: Math.round(performance.now() - previewStarted)
+        }));
       } catch (err) {
         console.warn("Thumb fetch failed", err);
       } finally {

@@ -2,6 +2,8 @@ import os
 import time
 import shutil
 import uuid
+import hashlib
+import mimetypes
 from datetime import datetime
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
@@ -64,6 +66,10 @@ class AutoIndexHandler(FileSystemEventHandler):
             
             # We COPY instead of move so the user keeps their original file
             shutil.copy2(local_path, vault_path)
+            digest = hashlib.sha256()
+            with open(vault_path, 'rb') as copied_file:
+                for block in iter(lambda: copied_file.read(1024 * 1024), b''):
+                    digest.update(block)
 
             # 4. RECORD IN MONGODB
             media_doc = {
@@ -75,9 +81,18 @@ class AutoIndexHandler(FileSystemEventHandler):
                 "file_metadata": {
                     "original_name": filename,
                     "stored_name": stored_name,
-                    "size_bytes": os.path.getsize(local_path)
+                    "size_bytes": os.path.getsize(local_path),
+                    "mime_type": mimetypes.guess_type(filename)[0] or 'application/octet-stream'
                 },
+                "file_version": digest.hexdigest(),
                 "processing_status": "PENDING",
+                "ai_description": None,
+                "description_status": "PENDING" if media_type in ['IMAGE', 'VIDEO', 'AUDIO'] else "SKIPPED",
+                "description_error": None,
+                "description_generated_at": None,
+                "vector_ids": [],
+                "total_vectors": 0,
+                "error_message": None,
                 "created_at": datetime.utcnow()
             }
             db.media_items.insert_one(media_doc)

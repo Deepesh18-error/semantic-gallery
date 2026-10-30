@@ -232,17 +232,94 @@ def process_media_item(media_id):
 def _process_image(path):
     start = time.time()
     print(f"    ⏱️  [PREPROCESS] IMAGE: reading + resizing + base64 encoding...")
+
     with Image.open(path) as img:
         if img.mode != 'RGB':
             img = img.convert('RGB')
         img.thumbnail((1024, 1024), Image.Resampling.LANCZOS)
+
         buffered = io.BytesIO()
         img.save(buffered, format="JPEG", quality=85)
         b64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
 
-    print(f"    ⏱️  [PREPROCESS] IMAGE done in {time.time() - start:.3f}s | b64 size: {len(b64)/1024:.1f} KB")
-    return [{"type": "IMAGE", "data": b64, "metadata": {"chunk_index": 0}}]
+        # --- PHASE F: OCR STEP ---
+        # We run OCR on the already-resized PIL image object (still in memory).
+        # No extra file read needed — we reuse the resized img directly.
+        # This is zero-cost for images with no text (returns empty string fast).
+        ocr_text = _extract_ocr_text(img)
 
+    encode_time = time.time() - start
+    print(f"    ⏱️  [PREPROCESS] IMAGE done in {encode_time:.3f}s | b64 size: {len(b64)/1024:.1f} KB")
+
+    package = {
+        "type": "IMAGE",
+        "data": b64,
+        "metadata": {"chunk_index": 0}
+    }
+
+    # Only attach ocr_text to the package if OCR found meaningful content
+    # The embedding engine checks for this field's presence to decide
+    # whether to create a second OCR vector
+    if ocr_text:
+        package["ocr_text"] = ocr_text
+        print(f"    📝 [PREPROCESS] OCR found {len(ocr_text.split())} words — will create second vector.")
+    else:
+        print(f"    📷 [PREPROCESS] No text found via OCR — single visual vector only.")
+
+    return [package]
+
+
+def _extract_ocr_text(pil_image):
+    """
+    Phase F: Runs Tesseract OCR on a PIL image object.
+    Returns cleaned text if >= 15 words found, otherwise returns empty string.
+    Called only from _process_image — image is already resized to 1024px max.
+
+    Why 15 words minimum:
+    - Single words or short phrases (logos, watermarks) don't provide enough
+      semantic context to be worth a second Gemini embedding call.
+    - 15+ words means there's actual readable content (screenshot text,
+      document photo, sign with a sentence, code snippet, slide content).
+
+    Returns: str — cleaned OCR text if meaningful, empty string if not.
+    """
+    try:
+        import pytesseract
+        import os
+
+        # Set Tesseract binary path from env (Windows requires this)
+        tesseract_path = os.getenv("TESSERACT_PATH")
+        if tesseract_path:
+            pytesseract.pytesseract.tesseract_cmd = tesseract_path
+
+        ocr_start = time.time()
+
+        # Run OCR — returns a raw string with newlines and noise
+        raw_text = pytesseract.image_to_string(pil_image, lang='eng')
+
+        ocr_time = time.time() - ocr_start
+
+        # Clean: collapse all whitespace into single spaces
+        cleaned = ' '.join(raw_text.split())
+
+        word_count = len(cleaned.split())
+        print(f"    ⏱️  [PREPROCESS] OCR completed in {ocr_time:.3f}s | {word_count} words extracted")
+
+        # 15-word threshold: only meaningful text gets a second vector
+        if word_count >= 15:
+            return cleaned
+        else:
+            return ""
+
+    except ImportError:
+        # pytesseract not installed — silently skip, no crash
+        print(f"    ⚠️  [PREPROCESS] pytesseract not installed. OCR skipped.")
+        return ""
+    except Exception as e:
+        # Tesseract binary missing, image too small, etc — never crash the pipeline
+        print(f"    ⚠️  [PREPROCESS] OCR failed silently: {str(e)}")
+        return ""
+    
 
 
 # DOCUMENT PROCESSOR — Fixed edge cases

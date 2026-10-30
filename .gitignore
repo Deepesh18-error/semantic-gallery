@@ -42,3 +42,5 @@ generate_code_snapshot.py
 all_code_snapshot.txt
 
 backend/media_vault/
+.phase0_snapshot/
+evaluation/results/

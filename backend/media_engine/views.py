@@ -8,6 +8,8 @@ from django.http import FileResponse, HttpResponse
 import mimetypes
 from django.conf import settings
 import os
+import time
+import hashlib
 import uuid
 from datetime import datetime
 from .database import db
@@ -19,6 +21,7 @@ from .pinecone_service import get_pinecone_index
 from bson import ObjectId
 import json
 from .search_service import execute_search
+from .contracts import SearchRequest, SearchValidationError, SEARCH_SCHEMA_VERSION
 
 
 class MongoJSONEncoder(json.JSONEncoder):
@@ -195,9 +198,11 @@ def upload_media(request):
     file_path = os.path.join(upload_dir, stored_name)
 
     # Write the actual bytes to the hard drive
+    file_hash = hashlib.sha256()
     with open(file_path, 'wb+') as destination:
         for chunk in file_obj.chunks():
             destination.write(chunk)
+            file_hash.update(chunk)
 
     # 5. Record in MongoDB (The Catalog Card)
     media_doc = {
@@ -212,14 +217,18 @@ def upload_media(request):
             "mime_type": file_obj.content_type,
             "size_bytes": file_obj.size
         },
-        #  NEW PHASE 3 TRACKING FIELDS 
-        "processing_status": "PENDING", # PENDING -> PROCESSING -> EMBEDDED/FAILED
-        "embedding_started_at": None,
-        "embedding_ended_at": None,
-        "total_vectors": 0,
-        "vector_ids": [], # We will fill this with Pinecone IDs later
-        "error_message": None,
-        "created_at": datetime.utcnow()
+        "file_version": file_hash.hexdigest(),
+        "processing_status": "PENDING", 
+        
+        # --- PHASE 6: INTELLIGENCE CATALOG FIELDS ---
+        "ai_description": None,
+        "description_status": "PENDING" if media_type in ['IMAGE', 'VIDEO', 'AUDIO'] else "SKIPPED",
+        "description_error": None,
+        "description_generated_at": None,
+        # ---------------------------------------------
+
+        "created_at": datetime.utcnow(),
+        "vector_ids": [] 
     }
 
 
@@ -238,7 +247,7 @@ def upload_media(request):
 @api_view(['GET'])
 @token_required
 def serve_media_file(request, media_id):
-    item = db.media_items.find_one({"_id": media_id})
+    item = db.media_items.find_one({"_id": media_id, "user_id": request.user_id})
     if not item:
         return HttpResponse(status=404)
 
@@ -274,56 +283,6 @@ def serve_media_file(request, media_id):
 
     return FileResponse(open(file_path, 'rb'), content_type=content_type)
 
-
-
-@api_view(['DELETE'])
-@token_required # 🚀 Keep your security!
-def delete_media_item(request, media_id):
-    # 1. Fetch metadata & verify ownership (Security first)
-    media_item = db.media_items.find_one({
-        "_id": media_id, 
-        "user_id": request.user_id 
-    })
-    
-    if not media_item:
-        return Response({"error": "File not found or access denied"}, status=404)
-
-    try:
-        # 🚀 STEP 1: ERASE FROM PINECONE (The Librarian)
-        # Delete all chunks/segments at once using the list we saved
-        vector_ids = media_item.get('vector_ids', [])
-        if vector_ids:
-            try:
-                index = get_pinecone_index() # Use your existing helper
-                index.delete(ids=vector_ids)
-                print(f"🗑️ Pinecone: Erased {len(vector_ids)} vectors.")
-            except Exception as e:
-                print(f"⚠️ Pinecone Deletion Warning: {e}")
-
-        # 🚀 STEP 2: ERASE FROM DISK (The Physical Vault)
-        # A. Delete the main file (Video/PDF/Image)
-        file_path = media_item.get('file_path')
-        if file_path and os.path.exists(file_path):
-            os.remove(file_path)
-            print(f"🗑️ Vault: Main file erased.")
-
-        # B. Delete the Thumbnail (The missing logic from your version)
-        # This cleans up the .jpg files we generate for videos
-        thumb_path = media_item.get('file_metadata', {}).get('thumbnail_path')
-        if thumb_path and os.path.exists(thumb_path):
-            os.remove(thumb_path)
-            print("🗑️ Vault: Thumbnail erased.")
-
-        # 🚀 STEP 3: ERASE FROM MONGODB (The Metadata)
-        db.media_items.delete_one({"_id": media_id})
-        print("🗑️ MongoDB: Metadata purged.")
-
-        return Response({"success": "Item wiped from system"}, status=200)
-
-    except Exception as e:
-        print(f"❌ Delete Error: {str(e)}")
-        return Response({"error": "Failed to complete full erase"}, status=500)
-    
 
 
 @api_view(['POST'])
@@ -363,7 +322,7 @@ def get_media_batch_status(request):
     # We only fetch the essential status fields for speed
     items = list(db.media_items.find(
         {"_id": {"$in": media_ids}, "user_id": request.user_id},
-        {"_id": 1, "processing_status": 1, "error_message": 1, "total_vectors": 1}
+        {"_id": 1, "processing_status": 1, "error_message": 1, "total_vectors": 1, "failed_chunks": 1}
     ))
     
     return Response(items)
@@ -400,9 +359,15 @@ def get_embedding_info(request, media_id):
         {
             "processing_status": 1, 
             "total_vectors": 1, 
+            "failed_chunks": 1,
+            "file_version": 1,
             "vector_ids": 1, 
             "embedding_started_at": 1, 
-            "embedding_ended_at": 1
+            "embedding_ended_at": 1,
+            "ai_description": 1,
+            "description_status": 1,
+            "description_error": 1,
+            "description_generated_at": 1
         }
     )
     if not item:
@@ -417,23 +382,22 @@ def delete_media_item(request, media_id):
     if not item:
         return Response({"error": "File not found"}, status=404)
 
-    # A. DELETE FROM PINECONE FIRST (Cloud)
     vector_ids = item.get('vector_ids', [])
     if vector_ids:
         try:
             index = get_pinecone_index()
             index.delete(ids=vector_ids)
-            print(f"🗑️ Deleted {len(vector_ids)} vectors from Pinecone.")
-        except Exception as e:
-            print(f"⚠️ Pinecone delete failed: {e}")
+        except Exception:
+            return Response({"error": "Vector deletion failed; file was retained for retry", "code": "VECTOR_DELETE_FAILED"}, status=503)
 
-    # B. DELETE FROM VAULT (Physical)
-    file_path = item['file_path']
-    if os.path.exists(file_path):
-        os.remove(file_path)
+    try:
+        for file_path in (item.get('file_path'), item.get('file_metadata', {}).get('thumbnail_path')):
+            if file_path and os.path.exists(file_path):
+                os.remove(file_path)
+    except OSError:
+        return Response({"error": "File deletion failed; catalog entry was retained", "code": "FILE_DELETE_FAILED"}, status=503)
 
-    # C. DELETE FROM MONGODB (Metadata)
-    db.media_items.delete_one({"_id": media_id})
+    db.media_items.delete_one({"_id": media_id, "user_id": request.user_id})
 
     return Response({"message": "Fully erased."})
 
@@ -464,32 +428,43 @@ def search_media(request):
     Entry point for the Multimodal Search.
     Payload: { "query": "burger photo", "collection_id": "uuid", "file_type": "IMAGE", "limit": 10 }
     """
-    data = request.data
-    query_text = data.get('query', '').strip()
-    
-    # 1. Validation: Don't waste Gemini API credits on empty strings
-    if not query_text:
-        return Response({"error": "Search query cannot be empty"}, status=status.HTTP_400_BAD_REQUEST)
-
-    # 2. Extract optional filters
-    collection_id = data.get('collection_id') # Can be None
-    file_type = data.get('file_type')         # Can be None or "ALL"
-    limit = data.get('limit', 10)             # Default to 10
+    request_started = time.perf_counter()
+    try:
+        search_request = SearchRequest.parse(request.data)
+    except SearchValidationError as exc:
+        return Response({"error": str(exc), "code": "INVALID_SEARCH_REQUEST", "schema_version": SEARCH_SCHEMA_VERSION}, status=400)
+    query_text = search_request.query
+    collection_id = search_request.collection_id
+    file_type = search_request.file_type
+    limit = search_request.limit
+    if collection_id and not db.collections.find_one({"_id": collection_id, "user_id": request.user_id}, {"_id": 1}):
+        return Response({"error": "Collection not found or access denied", "code": "COLLECTION_NOT_FOUND", "schema_version": SEARCH_SCHEMA_VERSION}, status=404)
 
     print(f"📡 [API] Search request from User {request.user_id}: '{query_text}'")
 
     # 3. Call the search brain
-    search_results = execute_search(
-        user_id=request.user_id,
-        query_text=query_text,
-        collection_id=collection_id,
-        file_type=file_type,
-        limit=limit
-    )
+    constraints_ms = round((time.perf_counter() - request_started) * 1000, 2)
+    try:
+        search_results = execute_search(
+            user_id=request.user_id,
+            query_text=query_text,
+            collection_id=collection_id,
+            file_type=file_type,
+            limit=limit
+        )
+    except Exception as exc:
+        detail = str(exc).lower()
+        if "429" in detail or "resource_exhausted" in detail or "rate limit" in detail:
+            return Response({"error": "AI provider rate limit reached", "code": "RATE_LIMITED", "schema_version": SEARCH_SCHEMA_VERSION}, status=429)
+        return Response({"error": "Search service is unavailable", "code": "SEARCH_UNAVAILABLE", "schema_version": SEARCH_SCHEMA_VERSION}, status=503)
 
     # 4. Handle internal errors
     if "error" in search_results:
-        return Response(search_results, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        return Response({"error": search_results["error"], "code": "SEARCH_UNAVAILABLE", "schema_version": SEARCH_SCHEMA_VERSION}, status=503)
+
+    search_results.setdefault("metrics", {}).setdefault("timings_ms", {})["request_constraints"] = constraints_ms
+    search_results["metrics"]["api_wall_ms"] = round((time.perf_counter() - request_started) * 1000, 2)
+    search_results["schema_version"] = SEARCH_SCHEMA_VERSION
 
     return Response(search_results, status=status.HTTP_200_OK)
 
@@ -512,3 +487,17 @@ def get_search_history(request):
     safe_history = [serialize_doc(h) for h in history]
     
     return Response(safe_history, status=status.HTTP_200_OK)
+
+@api_view(['POST'])
+@token_required
+def retry_all_pending(request):
+    """Re-triggers all PENDING items for the current user."""
+    items = list(db.media_items.find(
+        {"user_id": request.user_id, "processing_status": "PENDING"},
+        {"_id": 1}
+    ))
+    ids = [str(item["_id"]) for item in items]
+    if not ids:
+        return Response({"message": "No pending items found."})
+    start_background_embedding(ids)
+    return Response({"message": f"Re-triggered {len(ids)} items."})

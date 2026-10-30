@@ -13,6 +13,7 @@ from .views import (
     list_collection_media,  
     search_media,         
     get_search_history,
+    retry_all_pending
 )
 
 urlpatterns = [
@@ -34,4 +35,5 @@ urlpatterns = [
     path('media/retry/<str:media_id>/', retry_embedding),
     path('media/info/<str:media_id>/', get_embedding_info),
     
+    path('media/retry-all/', retry_all_pending),
 ]

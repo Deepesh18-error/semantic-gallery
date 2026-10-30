@@ -25,7 +25,7 @@ const SmartMediaPreview = ({ mediaId, mediaType, processingStatus }) => {
 
     // Don't fetch until AI pipeline is fully done
     // This prevents 404s on thumbnails that haven't been generated yet
-    if (processingStatus !== 'EMBEDDED') {
+    if (!['EMBEDDED', 'PARTIALLY_EMBEDDED'].includes(processingStatus)) {
       setLoading(false);
       return;
     }
@@ -281,6 +281,8 @@ useEffect(() => {
 
         // C. Success Notification
         const justFinished = statusUpdates.filter(u => u.processing_status === 'EMBEDDED');
+        const partial = statusUpdates.filter(u => u.processing_status === 'PARTIALLY_EMBEDDED');
+        if (partial.length > 0) toast.error(`${partial.length} files are partly searchable. Retry to index missing segments.`, { id: 'partial-status' });
         if (justFinished.length > 0) {
             toast.success(`${justFinished.length} items fully indexed! 🧠`, { id: 'status-update' });
         }
@@ -483,7 +485,8 @@ useEffect(() => {
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-8">
             {mediaItems.map((item) => {
               const status = item.processing_status || 'PENDING';
-              const isEmbedded = status === 'EMBEDDED';
+              const isPartial = status === 'PARTIALLY_EMBEDDED';
+              const isEmbedded = status === 'EMBEDDED' || isPartial;
               const isProcessing = status === 'PROCESSING';
               const isFailed = status === 'FAILED';
 
@@ -532,7 +535,7 @@ useEffect(() => {
                       )}
                       {isEmbedded && (
                         <div className="bg-emerald-500 text-white px-3 py-1.5 rounded-2xl flex items-center gap-2 text-[10px] font-black uppercase tracking-widest shadow-lg">
-                          <Check className="w-3.5 h-3.5" /> Ready
+                          <Check className="w-3.5 h-3.5" /> {isPartial ? 'Partly indexed' : 'Ready'}
                         </div>
                       )}
                       {isFailed && (
@@ -543,7 +546,7 @@ useEffect(() => {
                     </div>
 
                     {/* RETRY BUTTON (Section 2) */}
-                    {isFailed && (
+                    {(isFailed || isPartial) && (
                       <div className="absolute inset-0 bg-red-50/60 backdrop-blur-[1px] flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity pointer-events-auto">
                         <button 
                           onClick={(e) => { e.stopPropagation(); handleRetry(item._id); }}
