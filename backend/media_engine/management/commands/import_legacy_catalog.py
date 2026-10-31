@@ -108,8 +108,8 @@ class Command(BaseCommand):
                     counts["missing_files"] += 1
                 if file.available and file.processing_status in ("PENDING", "PROCESSING"):
                     if not CatalogJob.objects.filter(file_version=file.current_version,
-                                                     stage="extract", state__in=["queued", "running"]).exists():
-                        scheduler.enqueue(file.current_version_id, "extract")
+                                                     state__in=["queued", "running"]).exists():
+                        scheduler.enqueue(file.current_version_id, "discover")
                         counts["queued_jobs"] += 1
                 for ordinal, vector_id in enumerate(row.get("vector_ids") or []):
                     segment = catalog.put_segment(file_version_id=file.current_version_id, ordinal=ordinal,

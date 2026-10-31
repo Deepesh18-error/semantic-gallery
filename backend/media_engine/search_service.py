@@ -6,6 +6,7 @@ from .gemini_service import get_query_embedding
 from .pinecone_service import get_pinecone_index
 from .database import db
 from .search_metrics import SearchMetrics
+from .provider_quota import call_with_quota
 from .contracts import SEARCH_SCHEMA_VERSION, representation_for_vector, coverage_for_item, source_matches_filter
 import threading
 from datetime import datetime
@@ -164,12 +165,13 @@ User query: {query_text}
 
     try:
         client = genai.Client(api_key=api_key)
-        if on_api_call:
-            on_api_call("intent")
-        response = client.models.generate_content(
+        flash_model = os.getenv("GEMINI_FLASH_MODEL", "gemini-2.5-flash-lite")
+        response = call_with_quota(flash_model, "intent", max(1, len(prompt) // 4),
+            lambda: client.models.generate_content(
             model=os.getenv("GEMINI_FLASH_MODEL", "gemini-2.5-flash-lite"),
             contents=prompt
-        )
+        ), estimated_output_tokens=40, priority="interactive",
+            on_send=(lambda: on_api_call("intent")) if on_api_call else None)
         data = _extract_json_object(response.text)
         intent = str(data.get("intent", "MIXED")).upper()
         if intent not in MODALITY_THRESHOLDS:
@@ -269,12 +271,13 @@ Candidates:
         print(f"  ðŸ¤– [RERANK] Sending {len(candidates)} candidates to Flash for scoring...")
 
         client = genai.Client(api_key=api_key)
-        if on_api_call:
-            on_api_call("rerank")
-        response = client.models.generate_content(
+        flash_model = os.getenv("GEMINI_FLASH_MODEL", "gemini-2.5-flash-lite")
+        response = call_with_quota(flash_model, "rerank", max(1, len(prompt) // 4),
+            lambda: client.models.generate_content(
             model=os.getenv("GEMINI_FLASH_MODEL", "gemini-2.5-flash-lite"),
             contents=prompt
-        )
+        ), estimated_output_tokens=max(40, len(candidates) * 4), priority="interactive",
+            on_send=(lambda: on_api_call("rerank")) if on_api_call else None)
 
         raw = response.text.strip()
 

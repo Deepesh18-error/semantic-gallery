@@ -2,7 +2,7 @@
 from pathlib import Path
 from uuid import uuid4
 
-from django.db import transaction
+from django.db import IntegrityError, transaction
 from django.db.models import F, Q
 from django.utils import timezone
 
@@ -91,33 +91,50 @@ class SQLiteCatalog:
     def set_setting(self, user_id, key, value):
         return CatalogSetting.objects.update_or_create(user_id=user_id, key=key, defaults={"value": value})[0]
 
-    def record_usage(self, user_id, provider, operation, *, calls=1, input_units=0, output_units=0):
+    def record_usage(self, user_id, provider, operation, *, calls=1, input_units=0, output_units=0, estimated_spend_usd=0):
         row, _ = CatalogUsage.objects.get_or_create(user_id=user_id, provider=provider,
                                                     operation=operation, day=timezone.localdate())
         CatalogUsage.objects.filter(pk=row.pk).update(calls=F("calls") + calls,
-            input_units=F("input_units") + input_units, output_units=F("output_units") + output_units)
+            input_units=F("input_units") + input_units, output_units=F("output_units") + output_units,
+            estimated_spend_usd=F("estimated_spend_usd") + estimated_spend_usd)
 
 
 class SQLiteJobScheduler:
-    def enqueue(self, file_version_id, stage):
-        job = CatalogJob.objects.create(id=str(uuid4()), file_version_id=file_version_id, stage=stage)
-        return job.id
+    def enqueue(self, file_version_id, stage, *, priority=50):
+        existing = CatalogJob.objects.filter(file_version_id=file_version_id,
+            state__in=["queued", "running", "paused"]).first()
+        if existing:
+            return existing.id
+        try:
+            return CatalogJob.objects.create(id=str(uuid4()), file_version_id=file_version_id,
+                                             stage=stage, priority=priority).id
+        except IntegrityError:
+            return CatalogJob.objects.get(file_version_id=file_version_id,
+                state__in=["queued", "running", "paused"]).id
 
-    @transaction.atomic
     def claim(self, owner, lease_seconds=300):
         from datetime import timedelta
         now = timezone.now()
-        candidate = CatalogJob.objects.filter(
+        candidates = CatalogJob.objects.filter(
             Q(state="queued", next_retry_at__isnull=True) |
             Q(state="queued", next_retry_at__lte=now) |
-            Q(state="running", lease_until__lte=now)).order_by("created_at").first()
-        if candidate is None:
-            return None
+            Q(state="running", lease_until__lte=now),
+            pause_requested=False, cancel_requested=False,
+            attempts__lt=F("max_attempts")).order_by("priority", "created_at")[:16]
         lease_until = now + timedelta(seconds=lease_seconds)
-        updated = CatalogJob.objects.filter(pk=candidate.pk).filter(
-            Q(state="queued") | Q(state="running", lease_until__lte=now)).update(
-                state="running", lease_owner=owner, lease_until=lease_until, attempts=F("attempts") + 1)
-        return CatalogJob.objects.get(pk=candidate.pk) if updated else None
+        for candidate in candidates:
+            with transaction.atomic():
+                updated = CatalogJob.objects.filter(pk=candidate.pk).filter(
+                    Q(state="queued", next_retry_at__isnull=True) |
+                    Q(state="queued", next_retry_at__lte=now) |
+                    Q(state="running", lease_until__lte=now),
+                    pause_requested=False, cancel_requested=False,
+                    attempts__lt=F("max_attempts")).update(
+                        state="running", lease_owner=owner, lease_until=lease_until,
+                        attempts=F("attempts") + 1)
+            if updated:
+                return CatalogJob.objects.get(pk=candidate.pk)
+        return None
 
     def finish(self, job_id, owner, *, error="", retry_seconds=0):
         from datetime import timedelta
@@ -126,6 +143,78 @@ class SQLiteJobScheduler:
                    "next_retry_at": timezone.now() + timedelta(seconds=retry_seconds) if error and retry_seconds else None}
         if CatalogJob.objects.filter(pk=job_id, lease_owner=owner, state="running").update(**updates) != 1:
             raise ValueError("Job lease is not owned by caller")
+
+    def advance(self, job_id, owner, next_stage):
+        if CatalogJob.objects.filter(pk=job_id, lease_owner=owner, state="running",
+                                     pause_requested=False, cancel_requested=False).update(
+            stage=next_stage, state="queued", attempts=0, progress_done=0, progress_total=0,
+            lease_owner="", lease_until=None, next_retry_at=None,
+            error="", error_category="") != 1:
+            raise ValueError("Job was stopped or lease was lost")
+
+    def fail(self, job_id, owner, *, category, message, retry_seconds=0):
+        from datetime import timedelta
+        job = CatalogJob.objects.get(pk=job_id)
+        retry = retry_seconds > 0 and job.attempts < job.max_attempts
+        state = "queued" if retry else "paused" if category in ("daily_budget", "credentials", "quota_unconfigured") else "unsupported" if category == "unsupported_format" else "failed"
+        next_retry = timezone.now() + timedelta(seconds=retry_seconds) if retry else None
+        if CatalogJob.objects.filter(pk=job_id, lease_owner=owner, state="running").update(
+            state=state, error_category=category, error=message[:2000],
+            next_retry_at=next_retry, lease_owner="", lease_until=None) != 1:
+            raise ValueError("Job lease is not owned by caller")
+
+    def control(self, job_id, user_id, action):
+        with transaction.atomic():
+            job = CatalogJob.objects.select_related("file_version__file").filter(
+                pk=job_id, file_version__file__user_id=user_id).first()
+            if not job:
+                return None
+            if action == "pause" and job.state in ("queued", "running"):
+                job.pause_requested = True
+                if job.state == "queued":
+                    job.state = "paused"
+            elif action == "resume" and job.state == "paused":
+                job.pause_requested = False
+                job.cancel_requested = False
+                job.state = "queued"
+                job.next_retry_at = None
+                job.attempts = 0
+            elif action == "cancel" and job.state in ("queued", "running", "paused"):
+                job.cancel_requested = True
+                if job.state != "running":
+                    job.state = "cancelled"
+            elif action == "retry" and job.state in ("failed", "cancelled", "unsupported"):
+                job.state = "queued"
+                job.attempts = 0
+                job.next_retry_at = None
+                job.cancel_requested = False
+                job.pause_requested = False
+            else:
+                raise ValueError("Action is not valid for this job state")
+            job.save()
+            return job
+
+    def stop_requested(self, job_id, owner):
+        job = CatalogJob.objects.get(pk=job_id)
+        if job.lease_owner != owner or job.state != "running":
+            return "lost"
+        if job.cancel_requested:
+            CatalogJob.objects.filter(pk=job_id, lease_owner=owner).update(
+                state="cancelled", lease_owner="", lease_until=None)
+            return "cancelled"
+        if job.pause_requested:
+            CatalogJob.objects.filter(pk=job_id, lease_owner=owner).update(
+                state="paused", lease_owner="", lease_until=None)
+            return "paused"
+        return None
+
+    def recover_exhausted(self):
+        now = timezone.now()
+        return CatalogJob.objects.filter(
+            Q(state="running", lease_until__lte=now) | Q(state="queued"),
+            attempts__gte=F("max_attempts")).update(
+            state="failed", error_category="retry_exhausted",
+            error="Maximum attempts reached", lease_owner="", lease_until=None)
 
     def set_progress(self, job_id, owner, done, total):
         if done < 0 or total < done:

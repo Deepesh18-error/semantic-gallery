@@ -82,6 +82,7 @@ DATABASES = {
     'default': {
         'ENGINE': 'django.db.backends.sqlite3',
         'NAME': Path(os.getenv('SEMANTIC_GALLERY_CATALOG_PATH', BASE_DIR / 'db.sqlite3')),
+        'OPTIONS': {'timeout': 30},
     }
 }
 

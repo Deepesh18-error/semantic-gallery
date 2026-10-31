@@ -7,6 +7,8 @@ if os.getenv("SEMANTIC_GALLERY_STORAGE", "legacy").lower() == "desktop":
         upload_media, serve_media_file, delete_media_item, get_media_batch_status,
         retry_embedding, get_embedding_info, list_collection_media, search_media,
         get_search_history, retry_all_pending,
+        control_job,
+        provider_usage,
     )
 else:
     from .views import (
@@ -47,3 +49,7 @@ urlpatterns = [
     
     path('media/retry-all/', retry_all_pending),
 ]
+
+if os.getenv("SEMANTIC_GALLERY_STORAGE", "legacy").lower() == "desktop":
+    urlpatterns.append(path('media/jobs/<str:job_id>/<str:action>/', control_job))
+    urlpatterns.append(path('provider/usage/', provider_usage))

@@ -4,6 +4,7 @@ import base64
 from datetime import datetime
 from google import genai
 from google.genai import types
+from .provider_quota import QuotaError, call_with_quota
 
 class EmbeddingFailedError(Exception):
     pass
@@ -67,14 +68,17 @@ def get_embedding(package):
             api_call_start = time.time()
             print(f"    ⏱️  [GEMINI INTERNAL] Sending to API at: {datetime.utcnow().strftime('%H:%M:%S.%f')}")
 
-            response = client.models.embed_content(
+            estimate = max(1, len(content_to_embed) // 4) if p_type == "TEXT" else {
+                "IMAGE": 2000, "VIDEO": 16000, "AUDIO": 3000}[p_type]
+            response = call_with_quota("gemini-embedding-2-preview", "embedding", estimate,
+                lambda: client.models.embed_content(
                 model="gemini-embedding-2-preview",
                 contents=content_to_embed,
                 config=types.EmbedContentConfig(
                     task_type="RETRIEVAL_DOCUMENT",
                     output_dimensionality=3072
                 )
-            )
+            ))
 
             api_call_end = time.time()
             network_time = api_call_end - api_call_start
@@ -91,6 +95,8 @@ def get_embedding(package):
             return vector
 
         except Exception as e:
+            if isinstance(e, QuotaError):
+                raise
             attempt += 1
             retry_msg = f"Attempt {attempt} FAILED: {str(e)}"
             print(f"    ⚠️  [GEMINI INTERNAL] {retry_msg}")
@@ -128,16 +134,15 @@ def get_query_embedding(text_query, on_api_call=None):
             # ⏱️ ACTUAL NETWORK CALL
             api_call_start = time.time()
             
-            if on_api_call:
-                on_api_call("embedding")
-            response = client.models.embed_content(
+            response = call_with_quota("gemini-embedding-2-preview", "query_embedding",
+                max(1, len(text_query) // 4), lambda: client.models.embed_content(
                 model="gemini-embedding-2-preview",
                 contents=text_query,
                 config=types.EmbedContentConfig(
                     task_type="RETRIEVAL_QUERY", 
                     output_dimensionality=3072
                 )
-            )
+            ), priority="interactive", on_send=(lambda: on_api_call("embedding")) if on_api_call else None)
 
             api_call_end = time.time()
             vector = response.embeddings[0].values
@@ -146,6 +151,8 @@ def get_query_embedding(text_query, on_api_call=None):
             return vector
 
         except Exception as e:
+            if isinstance(e, QuotaError):
+                raise
             attempt += 1
             print(f"    ⚠️ [SEARCH ENGINE] Query Attempt {attempt} FAILED: {str(e)}")
 
@@ -183,20 +190,23 @@ def get_description_embedding(description_text):
             start = time.time()
             print(f"    📐 [DESC EMBED] Embedding description with SEMANTIC_SIMILARITY...")
 
-            response = client.models.embed_content(
+            response = call_with_quota("gemini-embedding-2-preview", "description_embedding",
+                max(1, len(description_text) // 4), lambda: client.models.embed_content(
                 model="gemini-embedding-2-preview",
                 contents=description_text,
                 config=types.EmbedContentConfig(
                     task_type="SEMANTIC_SIMILARITY",   # <-- THE KEY CHANGE
                     output_dimensionality=3072
                 )
-            )
+            ))
 
             vector = response.embeddings[0].values
             print(f"    ✅ [DESC EMBED] Description vectorized in {time.time() - start:.3f}s")
             return vector
 
         except Exception as e:
+            if isinstance(e, QuotaError):
+                raise
             attempt += 1
             print(f"    ⚠️ [DESC EMBED] Attempt {attempt} FAILED: {str(e)}")
             if attempt < max_retries:
@@ -236,20 +246,23 @@ def get_ocr_text_embedding(ocr_text):
             start = time.time()
             print(f"    📝 [OCR EMBED] Embedding OCR text ({len(ocr_text_capped)} chars)...")
 
-            response = client.models.embed_content(
+            response = call_with_quota("gemini-embedding-2-preview", "ocr_embedding",
+                max(1, len(ocr_text_capped) // 4), lambda: client.models.embed_content(
                 model="gemini-embedding-2-preview",
                 contents=ocr_text_capped,
                 config=types.EmbedContentConfig(
                     task_type="RETRIEVAL_DOCUMENT",
                     output_dimensionality=3072
                 )
-            )
+            ))
 
             vector = response.embeddings[0].values
             print(f"    ✅ [OCR EMBED] OCR text vectorized in {time.time() - start:.3f}s")
             return vector
 
         except Exception as e:
+            if isinstance(e, QuotaError):
+                raise
             attempt += 1
             print(f"    ⚠️ [OCR EMBED] Attempt {attempt} FAILED: {str(e)}")
             if attempt < max_retries:

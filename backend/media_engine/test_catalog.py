@@ -98,11 +98,37 @@ class DesktopAPITests(TestCase):
         file_id = response.data["_id"]
         self.assertEqual(CatalogJob.objects.filter(file_version__file_id=file_id).count(), 1)
         self.assertEqual(self.client.get(f"/api/collections/{collection_id}/media/").data[0]["_id"], file_id)
-        self.assertEqual(self.client.get(f"/api/media/file/{file_id}/").status_code, 200)
+        file_response = self.client.get(f"/api/media/file/{file_id}/")
+        self.assertEqual(file_response.status_code, 200)
+        file_response.close()
         with patch("media_engine.gemini_service.get_query_embedding", side_effect=RuntimeError("offline")):
             response = self.client.post("/api/search/", {"query": "burger"}, format="json")
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.data["results"], [])
+
+    def test_stable_query_does_not_mix_preview_pinecone_vectors(self):
+        if os.getenv("SEMANTIC_GALLERY_STORAGE") != "desktop":
+            self.skipTest("desktop URL mode only")
+        from .models import CatalogSegment
+        from .auth_service import create_token
+        from .catalog_store import SQLiteCatalog
+        root = Path(self.temp.name)
+        path = root / "old.jpg"
+        path.write_bytes(b"old")
+        store = SQLiteCatalog()
+        store.put_source(source_id="source", user_id="alice", kind="linked_folder", root_path=root)
+        file = store.put_file(file_id="old", user_id="alice", source_id="source", path=path,
+                              source_type="IMAGE", mime_type="image/jpeg", fingerprint="oldhash")
+        segment = CatalogSegment.objects.create(file_version=file.current_version, ordinal=0,
+                                                representation="legacy_vector_reference")
+        CatalogVectorRecord.objects.create(id="old-vector", segment=segment, backend="pinecone",
+                                           model_config="gemini-embedding-2-preview:3072:v1", dimensions=3072)
+        self.client.credentials(HTTP_AUTHORIZATION="Bearer " + create_token("alice"))
+        with patch("media_engine.desktop_embedding.embed_query") as embed:
+            response = self.client.post("/api/search/", {"query": "burger"}, format="json")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["results"], [])
+        embed.assert_not_called()
 
 
 class LegacyImportTests(TestCase):

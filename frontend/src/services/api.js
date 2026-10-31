@@ -5,6 +5,9 @@ export const explainApiError = (error) => {
   if (!error.response) return 'Cannot reach the search service. Check your connection and try again.';
   const { status, data } = error.response;
   if (status === 401 || status === 403) return 'Your session has expired or access was denied. Sign in again.';
+  if (data?.code === 'DAILY_BUDGET') return 'The project reached its daily AI quota or spend budget. Indexing will stay paused until the limit resets.';
+  if (data?.code === 'QUOTA_UNCONFIGURED') return 'AI limits for this project and model have not been configured yet.';
+  if (data?.code === 'CREDENTIALS') return 'The AI provider credentials need attention.';
   if (status === 429 || data?.code === 'RATE_LIMITED') return 'The AI provider rate limit was reached. Please retry shortly.';
   if (data?.code === 'EXTRACTION_FAILED') return 'This file could not be read. Check its indexing status.';
   if (status === 503) return data?.error || 'A search service is temporarily unavailable. Please retry.';

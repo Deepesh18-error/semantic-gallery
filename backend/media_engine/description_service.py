@@ -9,6 +9,7 @@ from google.genai import types
 from .database import db
 from .gemini_service import get_description_embedding
 from .pinecone_service import get_pinecone_index
+from .provider_quota import call_with_quota
 from PIL import Image
 
 
@@ -369,10 +370,11 @@ Write 3-4 specific descriptive sentences. Do NOT mention that this is AI-generat
 
     # API Call to Gemini 2.5 Flash-Lite
     try:
-        response = client.models.generate_content(
-            model="gemini-2.5-flash-lite",
-            contents=content_payload
-        )
+        response = call_with_quota("gemini-2.5-flash-lite", "legacy_caption",
+            max(1, len(str(content_payload)) // 4),
+            lambda: client.models.generate_content(
+                model="gemini-2.5-flash-lite", contents=content_payload),
+            estimated_output_tokens=300)
         return response.text.strip()
 
     except Exception as e:

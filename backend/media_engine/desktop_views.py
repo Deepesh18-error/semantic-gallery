@@ -7,6 +7,7 @@ from pathlib import Path
 from uuid import uuid4, uuid5, NAMESPACE_URL
 
 from django.conf import settings
+from django.db import transaction
 from django.http import FileResponse, HttpResponse
 from rest_framework.decorators import api_view, parser_classes
 from rest_framework.parsers import MultiPartParser, FormParser
@@ -16,7 +17,7 @@ from .auth_service import create_token, hash_password, token_required, verify_pa
 from .catalog_store import SQLiteCatalog, SQLiteJobScheduler
 from .contracts import SEARCH_SCHEMA_VERSION, SearchRequest, SearchValidationError
 from .local_retrieval import SQLiteExactVectors, SQLiteFullText
-from .models import CatalogAccount, CatalogCollection, CatalogFile, CatalogJob, CatalogVectorRecord
+from .models import CatalogAccount, CatalogCollection, CatalogFile, CatalogJob, CatalogUsage, CatalogVectorRecord, ProviderQuota
 from .utils import validate_file
 
 catalog = SQLiteCatalog()
@@ -26,18 +27,24 @@ scheduler = SQLiteJobScheduler()
 def file_document(file):
     version = file.current_version
     collections = list(file.collections.values_list("id", flat=True))
+    job = CatalogJob.objects.filter(file_version=version).order_by("-created_at").first() if version else None
     return {"_id": file.id, "file_id": file.id, "user_id": file.user_id,
             "collection_id": collections[0] if collections else None,
             "media_type": file.source_type, "source_type": file.source_type,
             "file_path": file.path, "file_version": version.fingerprint if version else None,
             "processing_status": file.processing_status, "error_message": file.error_message,
+            "job": {"id": job.id, "stage": job.stage, "state": job.state,
+                    "attempts": job.attempts, "progress_done": job.progress_done,
+                    "progress_total": job.progress_total, "error_category": job.error_category,
+                    "next_retry_at": job.next_retry_at.isoformat() if job.next_retry_at else None} if job else None,
             "ai_description": file.ai_description, "description_status": file.description_status,
             "created_at": file.created_at.isoformat(),
             "file_metadata": {"original_name": file.original_name, "stored_name": Path(file.path).name,
                               "mime_type": file.mime_type, "size_bytes": file.size_bytes,
                               "thumbnail_path": file.thumbnail_path},
             "vector_ids": list(CatalogVectorRecord.objects.filter(
-                segment__file_version=version).values_list("id", flat=True)) if version else []}
+                segment__file_version=version).values_list("id", flat=True)) if version else [],
+            "total_vectors": CatalogVectorRecord.objects.filter(segment__file_version=version).count() if version else 0}
 
 
 @api_view(["POST"])
@@ -114,11 +121,12 @@ def upload_media(request):
     source_id = str(uuid5(NAMESPACE_URL, f"managed:{request.user_id}:{root}"))
     catalog.put_source(source_id=source_id, user_id=request.user_id,
                        kind="managed_import", root_path=str(root))
-    file = catalog.put_file(file_id=file_id, user_id=request.user_id, source_id=source_id,
-        path=str(path), source_type=source_type,
-        mime_type=upload.content_type or mimetypes.guess_type(upload.name)[0] or "application/octet-stream",
-        fingerprint=digest.hexdigest(), collection_id=collection_id, original_name=upload.name)
-    scheduler.enqueue(file.current_version_id, "extract")
+    with transaction.atomic():
+        file = catalog.put_file(file_id=file_id, user_id=request.user_id, source_id=source_id,
+            path=str(path), source_type=source_type,
+            mime_type=upload.content_type or mimetypes.guess_type(upload.name)[0] or "application/octet-stream",
+            fingerprint=digest.hexdigest(), collection_id=collection_id, original_name=upload.name)
+        scheduler.enqueue(file.current_version_id, "discover")
     return Response(file_document(file), status=201)
 
 
@@ -154,6 +162,11 @@ def delete_media_item(request, media_id):
     file = catalog.get_file(media_id, request.user_id)
     if file is None:
         return Response({"error": "File not found"}, status=404)
+    if CatalogJob.objects.filter(file_version__file=file, state="running").exists():
+        CatalogJob.objects.filter(file_version__file=file, state="running").update(cancel_requested=True)
+        return Response({"error": "Cancellation requested; delete after the active stage stops"}, status=409)
+    CatalogJob.objects.filter(file_version__file=file, state__in=["queued", "paused"]).update(
+        state="cancelled", cancel_requested=True)
     if CatalogVectorRecord.objects.filter(segment__file_version__file=file, backend="pinecone").exists():
         try:
             from .pinecone_service import get_pinecone_index
@@ -177,7 +190,8 @@ def delete_media_item(request, media_id):
 def get_media_batch_status(request):
     ids = [value for value in request.query_params.get("ids", "").split(",") if value][:100]
     return Response([{"_id": row.id, "processing_status": row.processing_status,
-                      "error_message": row.error_message} for row in CatalogFile.objects.filter(
+                      "error_message": row.error_message,
+                      "job": file_document(row)["job"]} for row in CatalogFile.objects.filter(
                           id__in=ids, user_id=request.user_id)])
 
 
@@ -196,10 +210,50 @@ def retry_embedding(request, media_id):
     file = catalog.get_file(media_id, request.user_id)
     if file is None:
         return Response({"error": "File not found"}, status=404)
-    scheduler.enqueue(file.current_version_id, "extract")
+    job = CatalogJob.objects.filter(file_version=file.current_version).order_by("-created_at").first()
+    if job and job.state in ("failed", "cancelled", "unsupported"):
+        scheduler.control(job.id, request.user_id, "retry")
+    elif job and job.state == "paused":
+        scheduler.control(job.id, request.user_id, "resume")
+    elif not job or job.state == "done":
+        scheduler.enqueue(file.current_version_id, "discover")
     file.processing_status = "PENDING"
     file.save(update_fields=["processing_status"])
     return Response({"message": "Retry queued."})
+
+
+@api_view(["POST"])
+@token_required
+def control_job(request, job_id, action):
+    if action not in ("pause", "resume", "cancel", "retry"):
+        return Response({"error": "Unknown action"}, status=400)
+    try:
+        job = scheduler.control(job_id, request.user_id, action)
+    except ValueError as error:
+        return Response({"error": str(error)}, status=409)
+    if job is None:
+        return Response({"error": "Job not found"}, status=404)
+    file = job.file_version.file
+    if action == "pause":
+        file.processing_status = "PAUSED"
+    elif action == "cancel":
+        file.processing_status = "CANCELLED"
+    else:
+        file.processing_status = "PENDING"
+    file.save(update_fields=["processing_status"])
+    return Response({"job_id": job.id, "state": job.state, "stage": job.stage})
+
+
+@api_view(["GET"])
+@token_required
+def provider_usage(request):
+    from django.utils import timezone
+    rows = CatalogUsage.objects.filter(user_id=request.user_id, day=timezone.localdate())
+    return Response({"day": timezone.localdate().isoformat(),
+        "usage": [{"provider": row.provider, "operation": row.operation, "calls": row.calls,
+                   "input_units": row.input_units, "output_units": row.output_units,
+                   "estimated_spend_usd": str(row.estimated_spend_usd)} for row in rows],
+        "configured_models": list(ProviderQuota.objects.filter(enabled=True).values_list("model", flat=True))})
 
 
 @api_view(["POST"])
@@ -209,7 +263,7 @@ def retry_all_pending(request):
     count = 0
     for file in files:
         if not CatalogJob.objects.filter(file_version=file.current_version, state__in=["queued", "running"]).exists():
-            scheduler.enqueue(file.current_version_id, "extract")
+            scheduler.enqueue(file.current_version_id, "discover")
             count += 1
     return Response({"message": f"Queued {count} items."})
 
@@ -240,20 +294,23 @@ def search_media(request):
         ranked[segment.file_version.file_id] = (1.0, segment)
     # Existing imported vectors remain in Pinecone. The local catalog supplies ownership and paths.
     try:
-        if not CatalogVectorRecord.objects.filter(backend__in=["sqlite_exact", "pinecone"]).exists():
+        from .desktop_embedding import MODEL, MODEL_CONFIG
+        local_available = CatalogVectorRecord.objects.filter(backend="sqlite_exact", model_config=MODEL_CONFIG).exists()
+        legacy_available = MODEL == "gemini-embedding-2-preview" and CatalogVectorRecord.objects.filter(backend="pinecone").exists()
+        if not (local_available or legacy_available):
             raise LookupError("No vector records yet")
-        from .gemini_service import get_query_embedding
-        vector = get_query_embedding(search.query)
+        from .desktop_embedding import embed_query
+        vector = embed_query(search.query, request.user_id)
         if vector:
             local_hits = SQLiteExactVectors().query(vector, user_id=request.user_id,
-                model_config="gemini-embedding-2-preview:3072:v1",
+                model_config=MODEL_CONFIG,
                 collection_id=search.collection_id, source_type=search.file_type, limit=50)
             for hit in local_hits:
                 segment = CatalogSegment.objects.select_related("file_version__file").get(pk=hit["segment_id"])
                 previous = ranked.get(hit["file_id"])
                 if previous is None or hit["score"] > previous[0]:
                     ranked[hit["file_id"]] = (hit["score"], segment)
-            if CatalogVectorRecord.objects.filter(backend="pinecone").exists():
+            if legacy_available:
                 from .pinecone_service import get_pinecone_index
                 vector_filter = {"user_id": request.user_id}
                 if search.collection_id:
@@ -266,6 +323,9 @@ def search_media(request):
                     file = catalog.get_file(file_id, request.user_id) if file_id else None
                     if not file or not file.available or (search.file_type and file.source_type != search.file_type):
                         continue
+                    if not CatalogVectorRecord.objects.filter(pk=match.id, backend="pinecone",
+                            segment__file_version_id=file.current_version_id).exists():
+                        continue
                     if search.collection_id and not file.collections.filter(id=search.collection_id).exists():
                         continue
                     previous = ranked.get(file_id)
@@ -277,6 +337,13 @@ def search_media(request):
         # Full text remains available when the provider or Pinecone is offline.
         provider_error = error
     if provider_error and not ranked:
+        from .provider_quota import QuotaError
+        if isinstance(provider_error, QuotaError):
+            status_code = 429 if provider_error.category in ("rate_limit", "daily_budget") else 503
+            return Response({"error": provider_error.category.replace("_", " "),
+                             "code": provider_error.category.upper(),
+                             "retry_after_seconds": provider_error.retry_seconds,
+                             "schema_version": SEARCH_SCHEMA_VERSION}, status=status_code)
         detail = str(provider_error).lower()
         if "429" in detail or "resource_exhausted" in detail or "rate limit" in detail:
             return Response({"error": "AI provider rate limit reached", "code": "RATE_LIMITED",

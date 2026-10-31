@@ -119,11 +119,19 @@ class CatalogJob(models.Model):
     lease_until = models.DateTimeField(null=True)
     next_retry_at = models.DateTimeField(null=True)
     error = models.TextField(blank=True)
+    error_category = models.CharField(max_length=40, blank=True)
+    priority = models.PositiveSmallIntegerField(default=50)
+    max_attempts = models.PositiveSmallIntegerField(default=5)
+    pause_requested = models.BooleanField(default=False)
+    cancel_requested = models.BooleanField(default=False)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
         indexes = [models.Index(fields=["state", "next_retry_at", "lease_until"])]
+        constraints = [models.UniqueConstraint(fields=["file_version"],
+            condition=models.Q(state__in=["queued", "running", "paused"]),
+            name="unique_active_file_version_job")]
 
 
 class CatalogSetting(models.Model):
@@ -143,6 +151,44 @@ class CatalogUsage(models.Model):
     calls = models.PositiveIntegerField(default=0)
     input_units = models.BigIntegerField(default=0)
     output_units = models.BigIntegerField(default=0)
+    estimated_spend_usd = models.DecimalField(max_digits=12, decimal_places=6, default=0)
 
     class Meta:
         constraints = [models.UniqueConstraint(fields=["user_id", "provider", "operation", "day"], name="unique_daily_usage")]
+
+
+class ProviderQuota(models.Model):
+    project_id = models.CharField(max_length=128)
+    model = models.CharField(max_length=128)
+    rpm = models.PositiveIntegerField()
+    input_tpm = models.PositiveIntegerField()
+    rpd = models.PositiveIntegerField()
+    daily_spend_usd = models.DecimalField(max_digits=10, decimal_places=4, null=True)
+    input_usd_per_million = models.DecimalField(max_digits=10, decimal_places=6, default=0)
+    output_usd_per_million = models.DecimalField(max_digits=10, decimal_places=6, default=0)
+    enabled = models.BooleanField(default=True)
+    blocked_until = models.DateTimeField(null=True)
+    block_reason = models.CharField(max_length=40, blank=True)
+
+    class Meta:
+        constraints = [models.UniqueConstraint(fields=["project_id", "model"], name="unique_project_model_quota")]
+
+
+class ProviderCall(models.Model):
+    id = models.CharField(max_length=128, primary_key=True)
+    quota = models.ForeignKey(ProviderQuota, on_delete=models.CASCADE, related_name="calls")
+    user_id = models.CharField(max_length=128, blank=True)
+    operation = models.CharField(max_length=64)
+    priority = models.CharField(max_length=16)
+    estimated_input_tokens = models.PositiveIntegerField(default=0)
+    estimated_output_tokens = models.PositiveIntegerField(default=0)
+    actual_input_tokens = models.PositiveIntegerField(null=True)
+    actual_output_tokens = models.PositiveIntegerField(null=True)
+    estimated_spend_usd = models.DecimalField(max_digits=12, decimal_places=6, default=0)
+    state = models.CharField(max_length=20, default="reserved")
+    error_category = models.CharField(max_length=40, blank=True)
+    reserved_at = models.DateTimeField(auto_now_add=True)
+    completed_at = models.DateTimeField(null=True)
+
+    class Meta:
+        indexes = [models.Index(fields=["quota", "reserved_at"])]

@@ -392,6 +392,25 @@ useEffect(() => {
     }
   };
 
+  const handleJobAction = async (item, action) => {
+    if (!item.job?.id) return;
+    try {
+      const response = await api.post(`/media/jobs/${item.job.id}/${action}/`);
+      const nextStatus = action === 'pause' ? 'PAUSED' : action === 'cancel' ? 'CANCELLED' : 'PENDING';
+      setMediaItems(previous => previous.map(row => row._id === item._id
+        ? { ...row, processing_status: nextStatus, job: { ...row.job, state: response.data.state } }
+        : row));
+      if (action === 'resume' || action === 'retry') {
+        setPendingIds(previous => [...new Set([...previous, item._id])]);
+      } else {
+        setPendingIds(previous => previous.filter(id => id !== item._id));
+      }
+      toast.success({ pause: 'Job paused', resume: 'Job resumed', cancel: 'Job cancelled', retry: 'Job queued' }[action]);
+    } catch (error) {
+      toast.error(error.response?.data?.error || `Could not ${action} job`);
+    }
+  };
+
   const handleHeaderSearch = (e) => {
   if (e.key === 'Enter' && localSearch.trim()) {
     navigate(`/search?q=${encodeURIComponent(localSearch)}&collectionId=${collectionId}`);
@@ -505,7 +524,7 @@ useEffect(() => {
                   className={`
                     group bg-white rounded-[40px] border border-slate-100 overflow-hidden relative
                     transition-all duration-500
-                    ${isEmbedded ? 'hover:shadow-2xl cursor-pointer' : 'pointer-events-none'}
+                    ${isEmbedded ? 'hover:shadow-2xl cursor-pointer' : ''}
                     ${isFailed ? 'border-red-100' : ''}
                   `}
                 >
@@ -543,6 +562,11 @@ useEffect(() => {
                           <XCircle className="w-3.5 h-3.5" /> Failed
                         </div>
                       )}
+                      {['PAUSED', 'CANCELLED', 'UNSUPPORTED'].includes(status) && (
+                        <div className="bg-amber-600 text-white px-3 py-1.5 rounded-2xl text-[10px] font-black uppercase tracking-widest shadow-lg">
+                          {status.toLowerCase()}
+                        </div>
+                      )}
                     </div>
 
                     {/* RETRY BUTTON (Section 2) */}
@@ -572,13 +596,26 @@ useEffect(() => {
                         </div>
                         
                         <button 
-                          onClick={(e) => { e.stopPropagation(); isEmbedded && handleDelete(item._id); }} 
-                          className={`p-3 rounded-2xl transition-all ${isEmbedded ? 'text-slate-300 hover:text-red-500 hover:bg-red-50' : 'text-slate-100 pointer-events-none'}`}
-                          disabled={!isEmbedded}
+                          onClick={(e) => { e.stopPropagation(); handleDelete(item._id); }}
+                          className="p-3 rounded-2xl transition-all text-slate-300 hover:text-red-500 hover:bg-red-50"
                         >
                           <Trash2 className="w-5 h-5" />
                         </button>
                       </div>
+
+                      {item.job && (
+                        <div className="text-[10px] text-slate-500" onClick={(event) => event.stopPropagation()}>
+                          <p>{item.job.stage} {item.job.progress_total > 0 && `${item.job.progress_done}/${item.job.progress_total}`}</p>
+                          {item.job.next_retry_at && <p>Retry after {new Date(item.job.next_retry_at).toLocaleTimeString()}</p>}
+                          {item.job.error_category && <p>{item.job.error_category}: {item.error_message || 'Check provider settings'}</p>}
+                          <div className="flex flex-wrap gap-2 mt-2">
+                            {['queued', 'running'].includes(item.job.state) && <button onClick={() => handleJobAction(item, 'pause')}>Pause</button>}
+                            {item.job.state === 'paused' && <button onClick={() => handleJobAction(item, 'resume')}>Resume</button>}
+                            {['queued', 'running', 'paused'].includes(item.job.state) && <button onClick={() => handleJobAction(item, 'cancel')}>Cancel</button>}
+                            {['failed', 'cancelled', 'unsupported'].includes(item.job.state) && <button onClick={() => handleJobAction(item, 'retry')}>Retry</button>}
+                          </div>
+                        </div>
+                      )}
 
                       {/* 🧠 INTELLIGENCE CHIP (Section 3) */}
                       {isEmbedded && item.total_vectors > 0 && (

@@ -3,7 +3,7 @@ from pathlib import Path
 from django.core.management.base import BaseCommand, CommandError
 from django.db import connection
 
-from media_engine.models import CatalogAccount, CatalogCollection, CatalogFile, CatalogJob, CatalogVectorRecord
+from media_engine.models import CatalogAccount, CatalogCollection, CatalogFile, CatalogJob, CatalogVectorRecord, ProviderQuota
 
 
 class Command(BaseCommand):
@@ -22,5 +22,7 @@ class Command(BaseCommand):
                    "collections": CatalogCollection.objects.count(), "files": files.count(),
                    "missing_paths": sum(not Path(file.path).is_file() for file in files.iterator()),
                    "vectors": CatalogVectorRecord.objects.count(), "jobs": CatalogJob.objects.count(),
-                   "fts_segments": fts_segments}
+                   "queued_jobs": CatalogJob.objects.filter(state="queued").count(),
+                   "paused_jobs": CatalogJob.objects.filter(state="paused").count(),
+                   "quotas": ProviderQuota.objects.count(), "fts_segments": fts_segments}
         self.stdout.write(str(summary))

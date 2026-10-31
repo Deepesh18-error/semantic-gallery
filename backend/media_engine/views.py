@@ -22,6 +22,7 @@ from bson import ObjectId
 import json
 from .search_service import execute_search
 from .contracts import SearchRequest, SearchValidationError, SEARCH_SCHEMA_VERSION
+from .provider_quota import QuotaError
 
 
 class MongoJSONEncoder(json.JSONEncoder):
@@ -453,6 +454,12 @@ def search_media(request):
             limit=limit
         )
     except Exception as exc:
+        if isinstance(exc, QuotaError):
+            return Response({"error": exc.category.replace("_", " "),
+                             "code": exc.category.upper(),
+                             "retry_after_seconds": exc.retry_seconds,
+                             "schema_version": SEARCH_SCHEMA_VERSION},
+                            status=429 if exc.category in ("rate_limit", "daily_budget") else 503)
         detail = str(exc).lower()
         if "429" in detail or "resource_exhausted" in detail or "rate limit" in detail:
             return Response({"error": "AI provider rate limit reached", "code": "RATE_LIMITED", "schema_version": SEARCH_SCHEMA_VERSION}, status=429)
