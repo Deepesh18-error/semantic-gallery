@@ -299,43 +299,25 @@ def search_media(request):
         ranked[segment.file_version.file_id] = (1.0, segment)
     # Existing imported vectors remain in Pinecone. The local catalog supplies ownership and paths.
     try:
-        from .desktop_embedding import MODEL, MODEL_CONFIG
-        local_available = CatalogVectorRecord.objects.filter(backend="sqlite_exact", model_config=MODEL_CONFIG).exists()
-        legacy_available = MODEL == "gemini-embedding-2-preview" and CatalogVectorRecord.objects.filter(backend="pinecone").exists()
-        if not (local_available or legacy_available):
+        from .desktop_embedding import (ACTIVE_INDEX_GENERATION, DIMENSIONS, INDEX_GENERATION,
+                                        MODEL_CONFIG, PREVIOUS_MODEL_CONFIG)
+        active_config = MODEL_CONFIG if ACTIVE_INDEX_GENERATION == INDEX_GENERATION else PREVIOUS_MODEL_CONFIG
+        local_available = CatalogVectorRecord.objects.filter(backend="sqlite_exact",
+            model_config=active_config, index_generation=ACTIVE_INDEX_GENERATION).exists()
+        if not local_available:
             raise LookupError("No vector records yet")
         from .desktop_embedding import embed_query
-        vector = embed_query(search.query, request.user_id)
+        vector = embed_query(search.query, request.user_id, generation=ACTIVE_INDEX_GENERATION)
         if vector:
             local_hits = SQLiteExactVectors().query(vector, user_id=request.user_id,
-                model_config=MODEL_CONFIG,
-                collection_id=search.collection_id, source_type=search.file_type, limit=50)
+                model_config=active_config, generation=ACTIVE_INDEX_GENERATION,
+                collection_id=search.collection_id, source_type=search.file_type, limit=50,
+                expected_dimensions=DIMENSIONS)
             for hit in local_hits:
                 segment = CatalogSegment.objects.select_related("file_version__file").get(pk=hit["segment_id"])
                 previous = ranked.get(hit["file_id"])
                 if previous is None or hit["score"] > previous[0]:
                     ranked[hit["file_id"]] = (hit["score"], segment)
-            if legacy_available:
-                from .pinecone_service import get_pinecone_index
-                vector_filter = {"user_id": request.user_id}
-                if search.collection_id:
-                    vector_filter["collection_id"] = search.collection_id
-                if search.file_type:
-                    vector_filter["file_type"] = {"$in": ["DOCUMENT", "TEXT"]} if search.file_type == "DOCUMENT" else search.file_type
-                response = get_pinecone_index().query(vector=vector, filter=vector_filter, top_k=50, include_metadata=True)
-                for match in response.matches:
-                    file_id = match.metadata.get("media_item_id")
-                    file = catalog.get_file(file_id, request.user_id) if file_id else None
-                    if not file or not file.available or (search.file_type and file.source_type != search.file_type):
-                        continue
-                    if not CatalogVectorRecord.objects.filter(pk=match.id, backend="pinecone",
-                            segment__file_version_id=file.current_version_id).exists():
-                        continue
-                    if search.collection_id and not file.collections.filter(id=search.collection_id).exists():
-                        continue
-                    previous = ranked.get(file_id)
-                    if previous is None or match.score > previous[0]:
-                        ranked[file_id] = (match.score, None)
     except LookupError:
         pass
     except Exception as error:
@@ -378,6 +360,8 @@ def search_media(request):
                         "end_seconds": segment.end_seconds} if segment else None})
         results.append(row)
     elapsed = round((time.perf_counter() - started) * 1000, 2)
-    return Response({"schema_version": SEARCH_SCHEMA_VERSION, "query": search.query,
+    from .desktop_embedding import ACTIVE_INDEX_GENERATION
+    return Response({"schema_version": SEARCH_SCHEMA_VERSION,
+                     "index_generation": ACTIVE_INDEX_GENERATION, "query": search.query,
                      "results": results, "total_count": len(results), "search_time_ms": elapsed,
                      "metrics": {"api_wall_ms": elapsed}})

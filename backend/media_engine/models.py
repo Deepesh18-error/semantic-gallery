@@ -113,6 +113,19 @@ class CatalogVectorRecord(models.Model):
         indexes = [models.Index(fields=["backend", "model_config", "index_generation"])]
 
 
+class CatalogEmbeddingCache(models.Model):
+    user_id = models.CharField(max_length=128)
+    model_config = models.CharField(max_length=255)
+    content_digest = models.CharField(max_length=64)
+    dimensions = models.PositiveIntegerField()
+    vector_blob = models.BinaryField()
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [models.UniqueConstraint(fields=["user_id", "model_config", "content_digest"],
+                                               name="unique_embedding_cache_key")]
+
+
 class CatalogJob(models.Model):
     id = models.CharField(max_length=128, primary_key=True)
     file_version = models.ForeignKey(CatalogFileVersion, on_delete=models.CASCADE, related_name="jobs")

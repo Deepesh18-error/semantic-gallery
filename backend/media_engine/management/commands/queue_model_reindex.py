@@ -4,8 +4,8 @@ import os
 from django.core.management.base import BaseCommand, CommandError
 
 from media_engine.catalog_store import SQLiteJobScheduler
-from media_engine.desktop_embedding import MODEL_CONFIG
-from media_engine.models import CatalogFile, CatalogJob, CatalogVectorRecord
+from media_engine.desktop_embedding import INDEX_GENERATION, MODEL_CONFIG
+from media_engine.models import CatalogFile, CatalogJob, CatalogSegment, CatalogVectorRecord
 
 
 class Command(BaseCommand):
@@ -30,8 +30,11 @@ class Command(BaseCommand):
         count = 0
         queued = 0
         for file in files.order_by("id").iterator():
-            if CatalogVectorRecord.objects.filter(segment__file_version_id=file.current_version_id,
-                                                   backend="sqlite_exact", model_config=MODEL_CONFIG).exists():
+            segments = CatalogSegment.objects.filter(file_version_id=file.current_version_id).count()
+            vectors = CatalogVectorRecord.objects.filter(segment__file_version_id=file.current_version_id,
+                backend="sqlite_exact", model_config=MODEL_CONFIG,
+                index_generation=INDEX_GENERATION).count()
+            if segments and vectors >= segments:
                 continue
             if CatalogJob.objects.filter(file_version_id=file.current_version_id,
                                          state__in=["queued", "running", "paused"]).exists():

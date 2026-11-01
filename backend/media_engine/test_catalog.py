@@ -53,6 +53,8 @@ class CatalogStorageTests(TestCase):
         self.assertEqual(vectors.query([1, 0, 0], user_id="alice", model_config="test")[0]["file_id"], "file")
         self.assertEqual(vectors.query([1, 0, 0], user_id="bob", model_config="test"), [])
         self.assertEqual(vectors.query([1, 0, 0], user_id="alice", model_config="test", source_type="IMAGE"), [])
+        self.assertEqual(vectors.query([1, 0, 0], user_id="alice", model_config="test", generation=2), [])
+        self.assertEqual(vectors.query([1, 0, 0], user_id="alice", model_config="different"), [])
         self.assertEqual(vectors.delete("v1"), 1)
         self.assertEqual(vectors.query([1, 0, 0], user_id="alice", model_config="test"), [])
 

@@ -134,7 +134,8 @@ class CatalogWorker:
                 raise ExtractionError("extraction_failed", "No segments to index")
             return
         if job.stage == "embed":
-            from .desktop_embedding import MODEL_CONFIG, embed_segment
+            from .desktop_embedding import (CONFIG_FINGERPRINT, DIMENSIONS, INDEX_GENERATION,
+                                            MODEL_CONFIG, embed_segment)
             from .local_retrieval import SQLiteExactVectors
             segments = list(CatalogSegment.objects.filter(file_version=version).order_by("id"))
             self.scheduler.set_progress(job.id, self.owner, 0, len(segments))
@@ -142,24 +143,29 @@ class CatalogWorker:
                 if self.scheduler.stop_requested(job.id, self.owner):
                     return "stopped"
                 self._ensure_current(job)
-                vector_id = f"{file.id}:v{version.generation}:{segment.representation}:{segment.ordinal}"
+                vector_id = (f"g{INDEX_GENERATION}:{CONFIG_FINGERPRINT}:{file.id}:"
+                             f"v{version.generation}:{segment.representation}:{segment.ordinal}")
                 if not CatalogVectorRecord.objects.filter(pk=vector_id, segment=segment,
-                                                           model_config=MODEL_CONFIG, backend="sqlite_exact").exists():
+                                                           model_config=MODEL_CONFIG,
+                                                           index_generation=INDEX_GENERATION,
+                                                           backend="sqlite_exact").exists():
                     with self.resources.network:
                         values = embed_segment(segment, file.user_id)
                     self._ensure_current(job)
                     if self.scheduler.stop_requested(job.id, self.owner):
                         return "stopped"
                     SQLiteExactVectors().upsert(vector_id=vector_id, segment_id=segment.id,
-                        values=values, model_config=MODEL_CONFIG)
+                        values=values, model_config=MODEL_CONFIG, generation=INDEX_GENERATION,
+                        expected_dimensions=DIMENSIONS)
                 self.scheduler.set_progress(job.id, self.owner, index + 1, len(segments))
             return
         if job.stage == "publish":
             version, file = self._ensure_current(job, hash_file=True)
-            from .desktop_embedding import MODEL_CONFIG
+            from .desktop_embedding import INDEX_GENERATION, MODEL_CONFIG
             segments = CatalogSegment.objects.filter(file_version=version)
             if not segments.exists() or any(not CatalogVectorRecord.objects.filter(
-                    segment=segment, backend="sqlite_exact", model_config=MODEL_CONFIG).exists()
+                    segment=segment, backend="sqlite_exact", model_config=MODEL_CONFIG,
+                    index_generation=INDEX_GENERATION).exists()
                     for segment in segments):
                 raise ExtractionError("extraction_failed", "Not all segments have vectors")
             with transaction.atomic():
@@ -228,7 +234,10 @@ class CatalogWorker:
         except Exception as error:
             if self.scheduler.stop_requested(job.id, self.owner):
                 return True
-            category = error.category if isinstance(error, (ExtractionError, QuotaError)) else classify_provider_error(error)
+            from .desktop_embedding import InvalidEmbedding
+            category = (error.category if isinstance(error, (ExtractionError, QuotaError)) else
+                        "provider_rejected" if isinstance(error, InvalidEmbedding) else
+                        classify_provider_error(error))
             delay = 0
             if category in ("network", "rate_limit", "provider_error"):
                 delay = min(3600, max(getattr(error, "retry_seconds", 0),

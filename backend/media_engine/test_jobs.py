@@ -37,7 +37,7 @@ class DurablePipelineTests(TestCase):
 
     def test_stages_resume_and_publish_once(self):
         worker = CatalogWorker()
-        with patch("media_engine.desktop_embedding.embed_segment", return_value=[1, 0, 0]) as embed:
+        with patch("media_engine.desktop_embedding.embed_segment", return_value=[1] + [0] * 3071) as embed:
             for stage in ("validate", "extract", "keyword-index", "embed", "publish", "publish"):
                 self.assertTrue(worker.run_one(), f"Expected {stage}: {CatalogJob.objects.get(pk=self.job_id).__dict__}")
                 self.assertEqual(CatalogJob.objects.get(pk=self.job_id).stage, stage)
@@ -168,16 +168,16 @@ class QuotaTests(TestCase):
 
 class EmbeddingRequestTests(TestCase):
     def test_stable_query_uses_prefix_without_legacy_task_type(self):
-        from .desktop_embedding import embed_query
+        from .desktop_embedding import DIMENSIONS, embed_query
         response = MagicMock()
-        response.embeddings[0].values = [1, 0, 0]
+        response.embeddings = [MagicMock(values=[1] + [0] * (DIMENSIONS - 1))]
         client = MagicMock()
         client.models.embed_content.return_value = response
         with patch.dict(os.environ, {"GOOGLE_API_KEY": "test"}), \
              patch("media_engine.desktop_embedding.genai.Client", return_value=client), \
              patch("media_engine.desktop_embedding.call_with_quota",
                    side_effect=lambda model, operation, estimate, fn, **kwargs: fn()):
-            self.assertEqual(embed_query("burger", "alice"), [1, 0, 0])
+            self.assertEqual(embed_query("burger", "alice"), [1] + [0] * (DIMENSIONS - 1))
         kwargs = client.models.embed_content.call_args.kwargs
         self.assertEqual(kwargs["contents"], "task: search result | query: burger")
         self.assertIsNone(kwargs["config"].task_type)

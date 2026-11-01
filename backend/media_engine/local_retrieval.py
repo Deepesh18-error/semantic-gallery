@@ -12,8 +12,11 @@ class SQLiteExactVectors:
     """Exact cosine search. Stored float32 vectors survive process restart."""
     backend = "sqlite_exact"
 
-    def upsert(self, *, vector_id, segment_id, values, model_config, generation=1):
+    def upsert(self, *, vector_id, segment_id, values, model_config, generation=1,
+               expected_dimensions=None):
         vector = array("f", values)
+        if expected_dimensions is not None and len(vector) != expected_dimensions:
+            raise ValueError("Vector dimensions do not match the index configuration")
         if not vector or not all(float("-inf") < v < float("inf") for v in vector):
             raise ValueError("Vector must contain finite values")
         norm = sqrt(sumprod(vector, vector))
@@ -29,8 +32,11 @@ class SQLiteExactVectors:
                                     "dimensions": len(vector), "vector_blob": vector.tobytes()})
         return record
 
-    def query(self, values, *, user_id, model_config, collection_id=None, source_type=None, limit=20, generation=1):
+    def query(self, values, *, user_id, model_config, collection_id=None, source_type=None,
+              limit=20, generation=1, expected_dimensions=None):
         needle = array("f", values)
+        if expected_dimensions is not None and len(needle) != expected_dimensions:
+            raise ValueError("Query dimensions do not match the index configuration")
         norm = sqrt(sumprod(needle, needle)) if needle else 0
         if not needle or norm == 0:
             raise ValueError("Query vector must be nonzero")

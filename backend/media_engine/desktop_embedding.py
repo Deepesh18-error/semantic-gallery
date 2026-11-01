@@ -1,47 +1,135 @@
-"""One provider attempt per segment; the durable worker owns retry timing."""
+"""Versioned single-object embedding contract for the desktop index."""
+import hashlib
+import math
+import logging
 import os
+from array import array
 from pathlib import Path
 
 from google import genai
 from google.genai import types
 
+from .models import CatalogEmbeddingCache
 from .provider_quota import QuotaError, call_with_quota
 
+log = logging.getLogger(__name__)
+
 MODEL = os.getenv("GEMINI_EMBED_MODEL", "gemini-embedding-2")
-MODEL_CONFIG = f"{MODEL}:3072:search-prefix-v1"
+DIMENSIONS = 3072
+INDEX_GENERATION = 2
+PASSAGE_TOKENS = int(os.getenv("SEMANTIC_GALLERY_PASSAGE_TOKENS", "600"))
+MODEL_CONFIG = (f"{MODEL}:d{DIMENSIONS}:phase4-preprocess-v1:p{PASSAGE_TOKENS}:"
+                "retrieval-format-v2:l2")
+CONFIG_FINGERPRINT = hashlib.sha256(MODEL_CONFIG.encode("utf-8")).hexdigest()[:12]
+PREVIOUS_MODEL_CONFIG = f"{MODEL}:3072:search-prefix-v1"
+ACTIVE_INDEX_GENERATION = int(os.getenv("SEMANTIC_GALLERY_SEARCH_GENERATION", "1"))
+if ACTIVE_INDEX_GENERATION not in (1, INDEX_GENERATION):
+    raise ValueError("Unsupported search index generation")
+
+
+class InvalidEmbedding(ValueError):
+    pass
+
+
+def _normalize(values):
+    if values is None or len(values) != DIMENSIONS:
+        raise InvalidEmbedding(f"Expected {DIMENSIONS} dimensions")
+    try:
+        numbers = [float(value) for value in values]
+    except (TypeError, ValueError, OverflowError) as error:
+        raise InvalidEmbedding("Embedding contains a nonnumeric value") from error
+    if not all(math.isfinite(value) for value in numbers):
+        raise InvalidEmbedding("Embedding contains a nonfinite value")
+    norm = math.sqrt(math.fsum(value * value for value in numbers))
+    if not norm or not math.isfinite(norm):
+        raise InvalidEmbedding("Embedding has zero or invalid norm")
+    return [value / norm for value in numbers]
+
+
+def _single_embedding(response):
+    embeddings = getattr(response, "embeddings", None)
+    if embeddings is None or len(embeddings) != 1:
+        raise InvalidEmbedding("Provider must return one vector for one semantic object")
+    return _normalize(embeddings[0].values)
+
+
+def _cache_key(kind, payload):
+    digest = hashlib.sha256()
+    digest.update(kind.encode("utf-8"))
+    digest.update(b"\0")
+    digest.update(payload)
+    return digest.hexdigest()
+
+
+def _cached(user_id, digest):
+    row = CatalogEmbeddingCache.objects.filter(user_id=user_id, model_config=MODEL_CONFIG,
+                                               content_digest=digest).first()
+    if row is None or row.dimensions != DIMENSIONS:
+        return None
+    vector = array("f")
+    vector.frombytes(row.vector_blob)
+    return _normalize(vector)
+
+
+def _save_cache(user_id, digest, values):
+    CatalogEmbeddingCache.objects.update_or_create(
+        user_id=user_id, model_config=MODEL_CONFIG, content_digest=digest,
+        defaults={"dimensions": DIMENSIONS, "vector_blob": array("f", values).tobytes()})
+
+
+def _embed_one(content, estimate, *, user_id, operation, digest, priority):
+    cached = _cached(user_id, digest)
+    if cached is not None:
+        return cached
+    if not os.getenv("GOOGLE_API_KEY"):
+        raise QuotaError("credentials")
+    client = genai.Client(api_key=os.getenv("GOOGLE_API_KEY"))
+    response = call_with_quota(MODEL, operation, estimate,
+        lambda: client.models.embed_content(model=MODEL, contents=content,
+            config=types.EmbedContentConfig(output_dimensionality=DIMENSIONS)),
+        user_id=user_id, priority=priority)
+    vector = _single_embedding(response)
+    try:
+        _save_cache(user_id, digest, vector)
+    except Exception:
+        log.exception("Embedding cache write failed after successful provider call")
+    return vector
 
 
 def embed_segment(segment, user_id):
-    if not os.getenv("GOOGLE_API_KEY"):
-        raise QuotaError("credentials")
     if segment.representation in ("text", "ocr_text"):
-        title = segment.title or segment.file_version.file.original_name
-        heading = f"{segment.heading}\n" if segment.heading else ""
-        content = f"title: {title} | text: {heading}{segment.text}"
+        title = segment.title or segment.file_version.file.original_name or "none"
+        passage = f"{segment.heading}\n{segment.text}" if segment.heading else segment.text
+        content = f"title: {title} | text: {passage}"
+        digest = _cache_key("document-text-v2", content.encode("utf-8"))
         estimate = max(1, len(content) // 4)
     else:
         path = Path(segment.derivative_path)
         data = path.read_bytes()
         mime = {"visual": "image/jpeg", "video": "video/mp4", "audio": "audio/mpeg"}[segment.representation]
+        # One Part represents one file segment. Do not combine unrelated items.
         content = [types.Part.from_bytes(data=data, mime_type=mime)]
+        digest = _cache_key(segment.representation + ":" + mime, data)
         seconds = max(1, (segment.end_seconds or 0) - (segment.start_seconds or 0))
         estimate = {"visual": 2000, "video": int(seconds * 270),
                     "audio": int(seconds * 55)}[segment.representation]
-    client = genai.Client(api_key=os.getenv("GOOGLE_API_KEY"))
-    response = call_with_quota(MODEL, "embedding", estimate,
-        lambda: client.models.embed_content(model=MODEL, contents=content,
-            config=types.EmbedContentConfig(output_dimensionality=3072)),
-        user_id=user_id, priority="background")
-    return response.embeddings[0].values
+    return _embed_one(content, estimate, user_id=user_id, operation="embedding",
+                      digest=digest, priority="background")
 
 
-def embed_query(text, user_id):
-    if not os.getenv("GOOGLE_API_KEY"):
-        raise QuotaError("credentials")
-    client = genai.Client(api_key=os.getenv("GOOGLE_API_KEY"))
+def embed_query(text, user_id, *, generation=INDEX_GENERATION):
     content = f"task: search result | query: {text}"
-    response = call_with_quota(MODEL, "query_embedding", max(1, len(content) // 4),
-        lambda: client.models.embed_content(model=MODEL, contents=content,
-            config=types.EmbedContentConfig(output_dimensionality=3072)),
-        user_id=user_id, priority="interactive")
-    return response.embeddings[0].values
+    if generation == 1:
+        if not os.getenv("GOOGLE_API_KEY"):
+            raise QuotaError("credentials")
+        client = genai.Client(api_key=os.getenv("GOOGLE_API_KEY"))
+        response = call_with_quota(MODEL, "query_embedding", max(1, len(content) // 4),
+            lambda: client.models.embed_content(model=MODEL, contents=content,
+                config=types.EmbedContentConfig(output_dimensionality=DIMENSIONS)),
+            user_id=user_id, priority="interactive")
+        return _single_embedding(response)
+    if generation != INDEX_GENERATION:
+        raise ValueError("Unsupported index generation")
+    digest = _cache_key("search-query-v2", content.encode("utf-8"))
+    return _embed_one(content, max(1, len(content) // 4), user_id=user_id,
+                      operation="query_embedding", digest=digest, priority="interactive")
