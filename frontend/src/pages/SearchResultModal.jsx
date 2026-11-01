@@ -110,7 +110,7 @@ const SearchResultModal = ({ result, onClose, onFindSimilar }) => {
                 {result.media_type}
               </span>
               <span className={`px-3 py-1 rounded-full text-white text-[10px] font-black uppercase tracking-widest ${matchColor}`}>
-                {result.similarity_percentage}% SEMANTIC MATCH
+                {result.similarity_percentage == null ? 'MATCHED EVIDENCE' : `${result.similarity_percentage}% SEMANTIC MATCH`}
               </span>
             </div>
             <h2 className="text-xl font-black text-slate-900 truncate">

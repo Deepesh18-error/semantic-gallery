@@ -2,6 +2,7 @@
 from array import array
 from math import sqrt, sumprod
 from heapq import heappush, heapreplace
+import re
 
 from django.db import connection
 
@@ -78,8 +79,107 @@ class SQLiteExactVectors:
     def delete(self, vector_id):
         return CatalogVectorRecord.objects.filter(pk=vector_id, backend=self.backend).delete()[0]
 
+    def query_grouped(self, values, *, user_id, model_config, generation, collection_id=None,
+                      source_type=None, mime_type=None, per_group=20, per_file=2, expected_dimensions=None):
+        needle = array("f", values)
+        if expected_dimensions is not None and len(needle) != expected_dimensions:
+            raise ValueError("Query dimensions do not match the index configuration")
+        norm = sqrt(sumprod(needle, needle)) if needle else 0
+        if not norm or not all(float("-inf") < value < float("inf") for value in needle):
+            raise ValueError("Query vector must be finite and nonzero")
+        needle = array("f", (value / norm for value in needle))
+        sql = """SELECT r.id, r.segment_id, v.file_id, s.representation, r.vector_blob
+                 FROM media_engine_catalogvectorrecord r
+                 JOIN media_engine_catalogsegment s ON s.id=r.segment_id
+                 JOIN media_engine_catalogfileversion v ON v.id=s.file_version_id
+                 JOIN media_engine_catalogfile f ON f.id=v.file_id
+                 WHERE r.backend='sqlite_exact' AND r.model_config=%s AND r.index_generation=%s
+                   AND r.dimensions=%s AND r.vector_blob IS NOT NULL
+                   AND f.user_id=%s AND f.available=1 AND f.current_version_id=v.id
+                   AND s.representation IN ('visual','text','ocr_text','transcript','audio','video')"""
+        params = [model_config, generation, len(needle), user_id]
+        if source_type:
+            sql += " AND f.source_type=%s"
+            params.append(source_type)
+        if mime_type:
+            sql += " AND f.mime_type=%s"
+            params.append(mime_type)
+        if collection_id:
+            sql += " AND EXISTS (SELECT 1 FROM media_engine_catalogmembership m WHERE m.file_id=f.id AND m.collection_id=%s)"
+            params.append(collection_id)
+        buckets = {}
+        with connection.cursor() as cursor:
+            cursor.execute(sql, params)
+            while rows := cursor.fetchmany(128):
+                for vector_id, segment_id, file_id, representation, blob in rows:
+                    vector = array("f")
+                    vector.frombytes(blob)
+                    if len(vector) != len(needle):
+                        continue
+                    score = sumprod(needle, vector)
+                    key = (representation, file_id)
+                    bucket = buckets.setdefault(key, [])
+                    candidate = (score, vector_id, segment_id, file_id, representation)
+                    if len(bucket) < per_file:
+                        heappush(bucket, candidate)
+                    elif candidate > bucket[0]:
+                        heapreplace(bucket, candidate)
+        groups = {}
+        for (representation, file_id), bucket in buckets.items():
+            groups.setdefault(representation, []).append((max(row[0] for row in bucket), file_id, bucket))
+        return {representation: [{"score": score, "vector_id": vector_id,
+                 "segment_id": segment_id, "file_id": file_id,
+                 "representation": representation}
+                 for _, file_id, bucket in sorted(files, reverse=True)[:per_group]
+                 for score, vector_id, segment_id, _, _ in sorted(bucket, reverse=True)]
+                 for representation, files in groups.items()}
+
 
 class SQLiteFullText:
+    def search_evidence(self, query, *, user_id, collection_id=None, source_type=None,
+                        mime_type=None, limit=100, per_file=2):
+        terms = list(dict.fromkeys(re.findall(r"\w+", query.casefold())))[:12]
+        if not terms:
+            return []
+        expression = " OR ".join('"' + term.replace('"', '""') + '"' for term in terms)
+        sql = """SELECT s.id, v.file_id, s.representation, s.page_number,
+                        bm25(catalog_search_fts, 6.0, 4.0, 2.0, 1.0) AS rank,
+                        catalog_search_fts.filename, catalog_search_fts.title,
+                        catalog_search_fts.heading, catalog_search_fts.text
+                 FROM catalog_search_fts
+                 JOIN media_engine_catalogsegment s ON s.id=catalog_search_fts.rowid
+                 JOIN media_engine_catalogfileversion v ON v.id=s.file_version_id
+                 JOIN media_engine_catalogfile f ON f.id=v.file_id
+                 WHERE catalog_search_fts MATCH %s AND f.user_id=%s
+                   AND f.available=1 AND f.current_version_id=v.id"""
+        params = [expression, user_id]
+        if source_type:
+            sql += " AND f.source_type=%s"
+            params.append(source_type)
+        if mime_type:
+            sql += " AND f.mime_type=%s"
+            params.append(mime_type)
+        if collection_id:
+            sql += " AND EXISTS (SELECT 1 FROM media_engine_catalogmembership m WHERE m.file_id=f.id AND m.collection_id=%s)"
+            params.append(collection_id)
+        grouped = {}
+        with connection.cursor() as cursor:
+            cursor.execute(sql, params)
+            while rows := cursor.fetchmany(128):
+                for segment_id, file_id, representation, page, rank, filename, title, heading, text in rows:
+                    haystack = " ".join((filename or "", title or "", heading or "", text or "")).casefold()
+                    matches = sum(term in haystack for term in terms)
+                    row = {"segment_id": segment_id, "file_id": file_id,
+                           "representation": representation, "page_number": page,
+                           "bm25": rank, "matched_terms": matches,
+                           "query_terms": len(terms), "filename": filename}
+                    bucket = grouped.setdefault(file_id, [])
+                    bucket.append(row)
+                    bucket.sort(key=lambda item: (-item["matched_terms"], item["bm25"]))
+                    del bucket[per_file:]
+        return sorted((row for bucket in grouped.values() for row in bucket),
+                      key=lambda item: (-item["matched_terms"], item["bm25"]))[:limit]
+
     def search(self, query, *, user_id, collection_id=None, source_type=None, limit=20):
         terms = [part.strip('"') for part in query.split() if part.strip('"')]
         if not terms:

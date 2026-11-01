@@ -2,6 +2,7 @@
 import hashlib
 import mimetypes
 import os
+import re
 import time
 from pathlib import Path
 from uuid import uuid4, uuid5, NAMESPACE_URL
@@ -290,14 +291,19 @@ def search_media(request):
         return Response({"error": str(error), "code": "INVALID_SEARCH_REQUEST", "schema_version": SEARCH_SCHEMA_VERSION}, status=400)
     if search.collection_id and not CatalogCollection.objects.filter(id=search.collection_id, user_id=request.user_id).exists():
         return Response({"error": "Collection not found or access denied", "code": "COLLECTION_NOT_FOUND"}, status=404)
-    hits = SQLiteFullText().search(search.query, user_id=request.user_id,
-        collection_id=search.collection_id, source_type=search.file_type, limit=50)
-    ranked = {}
+    from .retrieval_pipeline import filename_hits, fuse, relevant, resolve_constraints
+    source_type, lexical_query = resolve_constraints(search, request.data)
+    mime_type = ("application/pdf" if request.data.get("file_type") is None and
+                 source_type == "DOCUMENT" and
+                 re.search(r"\bpdfs?\b", search.query, re.I) else None)
+    parsed_at = time.perf_counter()
+    keyword_hits = SQLiteFullText().search_evidence(lexical_query, user_id=request.user_id,
+        collection_id=search.collection_id, source_type=source_type, mime_type=mime_type, limit=100)
+    names = filename_hits(lexical_query, user_id=request.user_id,
+        collection_id=search.collection_id, source_type=source_type, mime_type=mime_type)
+    keywords_at = time.perf_counter()
+    semantic_groups = {}
     from .models import CatalogSegment
-    for hit in hits:
-        segment = CatalogSegment.objects.select_related("file_version__file").get(pk=hit["segment_id"])
-        ranked[segment.file_version.file_id] = (1.0, segment)
-    # Existing imported vectors remain in Pinecone. The local catalog supplies ownership and paths.
     try:
         from .desktop_embedding import (ACTIVE_INDEX_GENERATION, DIMENSIONS, INDEX_GENERATION,
                                         MODEL_CONFIG, PREVIOUS_MODEL_CONFIG)
@@ -309,20 +315,20 @@ def search_media(request):
         from .desktop_embedding import embed_query
         vector = embed_query(search.query, request.user_id, generation=ACTIVE_INDEX_GENERATION)
         if vector:
-            local_hits = SQLiteExactVectors().query(vector, user_id=request.user_id,
+            semantic_groups = SQLiteExactVectors().query_grouped(vector, user_id=request.user_id,
                 model_config=active_config, generation=ACTIVE_INDEX_GENERATION,
-                collection_id=search.collection_id, source_type=search.file_type, limit=50,
+                collection_id=search.collection_id, source_type=source_type, mime_type=mime_type,
+                per_group=20,
                 expected_dimensions=DIMENSIONS)
-            for hit in local_hits:
-                segment = CatalogSegment.objects.select_related("file_version__file").get(pk=hit["segment_id"])
-                previous = ranked.get(hit["file_id"])
-                if previous is None or hit["score"] > previous[0]:
-                    ranked[hit["file_id"]] = (hit["score"], segment)
     except LookupError:
         pass
     except Exception as error:
-        # Full text remains available when the provider or Pinecone is offline.
+        # Exact local evidence remains available when the provider is offline.
         provider_error = error
+    retrieved_at = time.perf_counter()
+    candidates = fuse(keyword_hits, semantic_groups, names)
+    ranked = [(file_id, entry) for file_id, entry in candidates.items() if relevant(entry)]
+    ranked.sort(key=lambda pair: pair[1]["rank_score"], reverse=True)
     if provider_error and not ranked:
         from .provider_quota import QuotaError
         if isinstance(provider_error, QuotaError):
@@ -338,30 +344,76 @@ def search_media(request):
         return Response({"error": "Search service is unavailable", "code": "SEARCH_UNAVAILABLE",
                          "schema_version": SEARCH_SCHEMA_VERSION}, status=503)
     results = []
-    for file_id, (score, segment) in sorted(ranked.items(), key=lambda pair: pair[1][0], reverse=True)[:search.limit]:
+    candidate_debug = None
+    if request.data.get("debug_candidates") is True:
+        candidate_debug = []
+        for candidate_file_id, entry in sorted(candidates.items(),
+                                               key=lambda pair: pair[1]["rank_score"], reverse=True)[:100]:
+            candidate_file = catalog.get_file(candidate_file_id, request.user_id)
+            if candidate_file is None:
+                continue
+            candidate_debug.append({"original_filename": candidate_file.original_name,
+                "file_id": candidate_file_id,
+                "semantic_cosine": max((details["raw_score"] for channel, details in
+                    entry["channels"].items() if channel.startswith("semantic:") and
+                    details["raw_score"] is not None), default=None),
+                "keyword_coverage": (entry["channels"].get("keyword") or {}).get("matched_terms"),
+                "query_terms": (entry["channels"].get("keyword") or {}).get("query_terms"),
+                "filename_match": "filename" in entry["channels"],
+                "passed_policy": relevant(entry)})
+    evidence_ids = {item["segment_id"] for _, entry in ranked[:search.limit]
+                    for item in entry["evidence"] if item.get("segment_id")}
+    segments = CatalogSegment.objects.in_bulk(evidence_ids)
+    for file_id, entry in ranked[:search.limit]:
         file = catalog.get_file(file_id, request.user_id)
         if file is None or not Path(file.path).is_file():
             continue
+        supporting = []
+        for item in entry["evidence"]:
+            segment = segments.get(item.get("segment_id"))
+            if segment is None:
+                continue
+            supporting.append({"representation": segment.representation,
+                "source": item["channel"], "semantic_cosine": item.get("score"),
+                "keyword_bm25": item.get("bm25"), "text_preview": segment.text[:300],
+                "location": {"page_number": segment.page_number,
+                    "source_start": segment.source_start, "source_end": segment.source_end,
+                    "start_seconds": segment.start_seconds,
+                    "end_seconds": segment.end_seconds}})
+        keyword_channel = entry["channels"].get("keyword") or {}
+        keyword_strong = (keyword_channel.get("matched_terms") is not None and
+                          keyword_channel.get("matched_terms") == keyword_channel.get("query_terms"))
+        primary = (next((item for item in supporting if item["source"] == "keyword"), None)
+                   if keyword_strong else
+                   max((item for item in supporting if item["source"].startswith("semantic:")),
+                       key=lambda item: item["semantic_cosine"], default=None))
+        if primary is None and "filename" not in entry["channels"]:
+            primary = supporting[0] if supporting else None
         row = file_document(file)
         row.update({"schema_version": SEARCH_SCHEMA_VERSION,
                     "media_item_id": file_id, "original_filename": file.original_name,
                     "file_size_bytes": file.size_bytes, "mime_type": file.mime_type,
-                    "similarity_percentage": round(score * 100),
+                    "similarity_percentage": None, "rank_score": entry["rank_score"],
+                    "retrieval_channels": entry["channels"],
+                    "supporting_evidence": supporting,
                     "availability": "available" if file.available else "missing",
                     "indexing_coverage": {"status": file.processing_status,
                         "partial": file.processing_status == "PARTIAL",
                         **(file.current_version.extraction_coverage if file.current_version else {})},
-                    "representation": segment.representation if segment else "legacy_vector",
-                    "evidence_source": "full_text" if segment and segment.text else "vector",
-                    "matched_chunk_preview": segment.text[:300] if segment else "",
-                    "location": {"page_number": segment.page_number,
-                        "source_start": segment.source_start, "source_end": segment.source_end,
-                        "start_seconds": segment.start_seconds,
-                        "end_seconds": segment.end_seconds} if segment else None})
+                    "representation": primary["representation"] if primary else "filename",
+                    "evidence_source": primary["source"] if primary else "filename",
+                    "matched_chunk_preview": primary["text_preview"] if primary else "",
+                    "matched_segment_start_time": primary["location"]["start_seconds"] if primary else None,
+                    "location": primary["location"] if primary else None})
         results.append(row)
     elapsed = round((time.perf_counter() - started) * 1000, 2)
     from .desktop_embedding import ACTIVE_INDEX_GENERATION
     return Response({"schema_version": SEARCH_SCHEMA_VERSION,
                      "index_generation": ACTIVE_INDEX_GENERATION, "query": search.query,
+                     "effective_file_type": source_type, "match_decision": "results" if results else "no_match",
                      "results": results, "total_count": len(results), "search_time_ms": elapsed,
-                     "metrics": {"api_wall_ms": elapsed}})
+                     **({"candidate_debug": candidate_debug} if candidate_debug is not None else {}),
+                     "metrics": {"api_wall_ms": elapsed,
+                                 "parse_ms": round((parsed_at - started) * 1000, 2),
+                                 "keyword_ms": round((keywords_at - parsed_at) * 1000, 2),
+                                 "semantic_ms": round((retrieved_at - keywords_at) * 1000, 2)}})

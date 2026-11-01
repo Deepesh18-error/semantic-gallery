@@ -30,9 +30,7 @@ const SearchResultCard = ({ result, onClick }) => {
     const fetchThumb = async () => {
       const previewStarted = performance.now();
       try {
-        const url = result.media_type === 'IMAGE' 
-          ? `/media/file/${result.media_item_id}/` 
-          : `/media/file/${result.media_item_id}/?thumbnail=true`;
+        const url = `/media/file/${result.media_item_id}/?thumbnail=true`;
 
         const res = await api.get(url, { responseType: 'blob' });
         objectUrl = URL.createObjectURL(res.data);
@@ -88,7 +86,7 @@ const SearchResultCard = ({ result, onClick }) => {
 
         {/* Similarity Badge (Top Right) */}
         <div className={`absolute top-4 right-4 z-10 px-3 py-1.5 rounded-2xl text-white text-[10px] font-black shadow-lg ${getScoreColor(result.similarity_percentage)}`}>
-           {result.similarity_percentage}% MATCH
+           {result.similarity_percentage == null ? 'MATCHED EVIDENCE' : `${result.similarity_percentage}% MATCH`}
         </div>
 
         {/* Play Icon Overlay (For Videos) */}

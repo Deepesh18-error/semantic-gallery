@@ -47,6 +47,7 @@ class CatalogStorageTests(TestCase):
         segment = self.store.put_segment(file_version_id=self.file.current_version_id,
             ordinal=0, representation="text", text="burger with fries")
         self.assertEqual(SQLiteFullText().search("burger", user_id="alice")[0]["segment_id"], segment.id)
+        self.assertEqual(SQLiteFullText().search_evidence("burger", user_id="alice")[0]["segment_id"], segment.id)
         self.assertEqual(SQLiteFullText().search("burger", user_id="bob"), [])
         vectors = SQLiteExactVectors()
         vectors.upsert(vector_id="v1", segment_id=segment.id, values=[1, 0, 0], model_config="test")
@@ -106,7 +107,8 @@ class DesktopAPITests(TestCase):
         with patch("media_engine.gemini_service.get_query_embedding", side_effect=RuntimeError("offline")):
             response = self.client.post("/api/search/", {"query": "burger"}, format="json")
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.data["results"], [])
+        self.assertEqual([row["file_id"] for row in response.data["results"]], [file_id])
+        self.assertEqual(response.data["results"][0]["evidence_source"], "filename")
 
     def test_stable_query_does_not_mix_preview_pinecone_vectors(self):
         if os.getenv("SEMANTIC_GALLERY_STORAGE") != "desktop":

@@ -34,6 +34,7 @@ def score_case(case, response):
         "type_violation": any(r.get("media_type") != case["file_type"] for r in response.get("results", [])) if case.get("file_type") else None,
         "requires_review": bool(case.get("requires_review")),
         "index_generation": response.get("index_generation"),
+        "candidate_debug": response.get("candidate_debug"),
         "metrics": response.get("metrics"),
     }
 
@@ -81,6 +82,7 @@ def main():
     parser.add_argument("--user-id", default=os.getenv("EVAL_USER_ID"))
     parser.add_argument("--token", default=os.getenv("EVAL_AUTH_TOKEN"))
     parser.add_argument("--repetitions", type=int, default=1)
+    parser.add_argument("--debug-candidates", action="store_true", help="Include owned candidate diagnostics for calibration")
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
     if args.mode == "offline":
@@ -108,7 +110,8 @@ def main():
                     else:
                         response = post_json(args.base_url.rstrip("/") + "/search/", args.token,
                                              {"query": case["query"], "collection_id": args.collection_id,
-                                              "file_type": case.get("file_type"), "limit": 20})
+                                              "file_type": case.get("file_type"), "limit": 20,
+                                              "debug_candidates": args.debug_candidates})
                     row = score_case(case, response)
                     row.update({"split": split, "repetition": repetition + 1,
                                 "client_round_trip_ms": round((time.perf_counter() - started) * 1000, 2)})

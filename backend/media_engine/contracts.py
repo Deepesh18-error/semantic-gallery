@@ -4,7 +4,7 @@ from dataclasses import dataclass
 SEARCH_SCHEMA_VERSION = 1
 SOURCE_TYPES = frozenset({"IMAGE", "VIDEO", "AUDIO", "DOCUMENT", "TEXT"})
 SEARCH_FILTERS = SOURCE_TYPES | {"ALL"}
-REPRESENTATIONS = frozenset({"visual", "text", "ocr_text", "audio", "video", "description"})
+REPRESENTATIONS = frozenset({"visual", "text", "ocr_text", "transcript", "audio", "video", "description"})
 MAX_QUERY_LENGTH = 500
 MAX_RESULTS = 20
 

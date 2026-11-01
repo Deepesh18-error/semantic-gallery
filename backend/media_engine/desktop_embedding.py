@@ -97,7 +97,7 @@ def _embed_one(content, estimate, *, user_id, operation, digest, priority):
 
 
 def embed_segment(segment, user_id):
-    if segment.representation in ("text", "ocr_text"):
+    if segment.representation in ("text", "ocr_text", "transcript"):
         title = segment.title or segment.file_version.file.original_name or "none"
         passage = f"{segment.heading}\n{segment.text}" if segment.heading else segment.text
         content = f"title: {title} | text: {passage}"
