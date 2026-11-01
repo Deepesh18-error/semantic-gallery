@@ -63,6 +63,7 @@ class CatalogFileVersion(models.Model):
     fingerprint = models.CharField(max_length=128, blank=True)
     size_bytes = models.BigIntegerField(default=0)
     modified_ns = models.BigIntegerField(null=True)
+    extraction_coverage = models.JSONField(default=dict, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
@@ -85,6 +86,11 @@ class CatalogSegment(models.Model):
     text = models.TextField(blank=True)
     derivative_path = models.TextField(blank=True)
     page_number = models.PositiveIntegerField(null=True)
+    source_start = models.PositiveIntegerField(null=True)
+    source_end = models.PositiveIntegerField(null=True)
+    heading = models.TextField(blank=True)
+    title = models.TextField(blank=True)
+    ocr_confidence = models.FloatField(null=True)
     start_seconds = models.FloatField(null=True)
     end_seconds = models.FloatField(null=True)
     created_at = models.DateTimeField(auto_now_add=True)

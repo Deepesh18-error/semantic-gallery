@@ -1,0 +1,9 @@
+# Phase 4 extraction
+
+The desktop worker keeps originals untouched. Image extraction applies EXIF orientation, writes a 320 px display thumbnail and an independent 1024 px visual embedding input, and runs OCR on an image up to 2400 px. Visual and OCR text are distinct segments. OCR tokens with confidence below 35 are discarded; short useful text such as `AWS VPC` is retained. The OCR threshold is a tuning value, not a guarantee of recognition quality.
+
+PDF extraction reads every page. Pages with less than 40 characters of digital text are rendered at 2x for selective Tesseract OCR. If OCR is worse than available digital text, the digital text is retained. Each passage records a page number, character offsets within the extracted page text, title, and heading. Failed page numbers and OCR page numbers are stored on the file version. A document with some failed pages publishes as `PARTIAL`; one with no searchable passages fails extraction and is never embedded as an error message. The complete passage is stored locally, while search cards show a preview.
+
+Text passage size defaults to approximately 600 tokens using a four-character estimate, with 160 characters of overlap. Set `SEMANTIC_GALLERY_PASSAGE_TOKENS` to tune it; evaluate retrieval quality and cost before raising it. Splitting prefers paragraph boundaries and otherwise uses word boundaries. TXT handles UTF-8, UTF-8 BOM, UTF-16 BOM, and CP1252 explicitly. DOCX reads paragraphs and table cells.
+
+The segment schema and FTS trigger are migrated in `0008` and `0009`. Run `backend\venv\Scripts\python.exe backend\manage.py migrate` before starting the worker. Existing indexed versions retain their previous segments; schedule a controlled reindex to gain new locations and OCR coverage. Tests include a twelve-page PDF with a deep AWS VPC passage, an image with two-word OCR, and a scanned PDF page.

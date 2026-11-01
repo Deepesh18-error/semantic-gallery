@@ -1,6 +1,8 @@
 """Extract bounded, repeatable segments from local files without MongoDB."""
 import subprocess
 import os
+import re
+import codecs
 from pathlib import Path
 
 from django.conf import settings
@@ -12,22 +14,39 @@ class ExtractionError(RuntimeError):
         self.category = category
 
 
-def _text_segments(text, *, page_number=None, max_chars=4000):
-    words = text.split()
+class ExtractedSegments(list):
+    def __init__(self, values=(), *, coverage=None):
+        super().__init__(values)
+        self.coverage = coverage or {}
+
+
+def _text_segments(text, *, page_number=None, max_chars=2800, overlap_chars=160, title=""):
+    # Keep original offsets and split first at paragraph boundaries, then words.
+    words = list(re.finditer(r"\S+", text))
     parts = []
-    batch = []
-    length = 0
-    for word in words:
-        if batch and length + len(word) + 1 > max_chars:
-            parts.append({"ordinal": len(parts), "representation": "text",
-                          "text": " ".join(batch), "page_number": page_number})
-            batch = []
-            length = 0
-        batch.append(word)
-        length += len(word) + 1
-    if batch:
+    start = 0
+    while start < len(words):
+        end = start
+        while end < len(words) and words[end].end() - words[start].start() <= max_chars:
+            end += 1
+        end = max(start + 1, end)
+        if end < len(words):
+            boundaries = [i for i in range(start + 1, end) if "\n\n" in text[words[i-1].end():words[i].start()]]
+            if boundaries and words[boundaries[-1]].start() - words[start].start() >= max_chars // 2:
+                end = boundaries[-1]
+        begin_offset, end_offset = words[start].start(), words[end-1].end()
+        passage = text[begin_offset:end_offset].strip()
+        heading = next((line.strip() for line in passage.splitlines() if line.strip()), "")[:200]
         parts.append({"ordinal": len(parts), "representation": "text",
-                      "text": " ".join(batch), "page_number": page_number})
+                      "text": passage, "page_number": page_number,
+                      "source_start": begin_offset, "source_end": end_offset,
+                      "heading": heading, "title": title})
+        if end >= len(words):
+            break
+        next_start = end
+        while next_start > start + 1 and words[end-1].end() - words[next_start-1].start() < overlap_chars:
+            next_start -= 1
+        start = min(end, next_start)
     return parts
 
 
@@ -36,7 +55,8 @@ def _text_budget():
     project_id = os.getenv("GEMINI_PROJECT_ID")
     model = os.getenv("GEMINI_EMBED_MODEL", "gemini-embedding-2")
     quota = ProviderQuota.objects.filter(project_id=project_id, model=model, enabled=True).first() if project_id else None
-    return min(4000, max(400, int(quota.input_tpm * 0.5 * 4))) if quota else 4000
+    configured = int(os.getenv("SEMANTIC_GALLERY_PASSAGE_TOKENS", "600"))
+    return min(3200, max(400, min(configured, 800) * 4), int(quota.input_tpm * 0.5 * 4)) if quota else min(3200, max(400, configured * 4))
 
 
 def _run(command):
@@ -49,26 +69,67 @@ def _run(command):
     return result.stdout
 
 
+def _read_text(path):
+    raw = path.read_bytes()
+    if raw.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)):
+        return raw.decode("utf-16")
+    if raw.startswith(codecs.BOM_UTF8):
+        return raw.decode("utf-8-sig")
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        try:
+            return raw.decode("cp1252")
+        except UnicodeDecodeError as error:
+            raise ExtractionError("extraction_failed", "Text encoding could not be decoded") from error
+
+
 def extract(file):
     path = Path(file.path)
     ext = path.suffix.lower()
     if not path.is_file():
         raise ExtractionError("missing_file", "Source file is missing")
     if file.source_type == "TEXT" or ext in (".txt", ".md"):
-        return _text_segments(path.read_text(encoding="utf-8", errors="replace"), max_chars=_text_budget())
+        return _text_segments(_read_text(path), max_chars=_text_budget(), title=file.original_name)
     if ext == ".pdf":
         try:
             import fitz
             result = []
+            failed_pages = []
+            ocr_pages = []
             budget = _text_budget()
             with fitz.open(path) as document:
+                total_pages = len(document)
                 for page_no, page in enumerate(document, 1):
-                    for part in _text_segments(page.get_text(), page_number=page_no, max_chars=budget):
+                    text = page.get_text(sort=True)
+                    method = "digital"
+                    if len(text.strip()) < 40:
+                        try:
+                            import pytesseract
+                            from PIL import Image
+                            import io
+                            pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
+                            ocr_text = pytesseract.image_to_string(Image.open(io.BytesIO(pix.tobytes("png"))))
+                            if len(ocr_text.strip()) > len(text.strip()):
+                                text = ocr_text
+                                method = "ocr"
+                                ocr_pages.append(page_no)
+                        except Exception:
+                            if not text.strip():
+                                failed_pages.append(page_no)
+                                continue
+                    if not text.strip():
+                        failed_pages.append(page_no)
+                        continue
+                    for part in _text_segments(text, page_number=page_no, max_chars=budget,
+                                               title=file.original_name):
+                        part["representation"] = "ocr_text" if method == "ocr" else "text"
                         part["ordinal"] = len(result)
                         result.append(part)
             if not result:
                 raise ExtractionError("extraction_failed", "PDF contains no extractable text")
-            return result
+            return ExtractedSegments(result, coverage={"failed_pages": failed_pages,
+                "ocr_pages": ocr_pages, "total_pages": total_pages})
         except ExtractionError:
             raise
         except Exception as error:
@@ -77,28 +138,45 @@ def extract(file):
         try:
             from docx import Document
             document = Document(path)
-            return _text_segments(" ".join(p.text for p in document.paragraphs if p.text.strip()),
-                                  max_chars=_text_budget())
+            blocks = [p.text for p in document.paragraphs if p.text.strip()]
+            for table in document.tables:
+                for row in table.rows:
+                    blocks.append(" | ".join(cell.text.strip() for cell in row.cells))
+            return _text_segments("\n\n".join(blocks), max_chars=_text_budget(), title=file.original_name)
         except Exception as error:
             raise ExtractionError("extraction_failed", str(error)) from error
     if file.source_type == "IMAGE":
         try:
-            from PIL import Image
+            from PIL import Image, ImageOps
             with Image.open(path) as image:
                 image.load()
-                image = image.convert("RGB")
-                image.thumbnail((1024, 1024))
+                image = ImageOps.exif_transpose(image).convert("RGB")
                 derivative = Path(settings.MEDIA_VAULT) / "derivatives" / file.id / str(file.current_version_id)
                 derivative.mkdir(parents=True, exist_ok=True)
+                thumbnail = image.copy()
+                thumbnail.thumbnail((320, 320))
+                thumbnail.save(derivative / "thumbnail.jpg", "JPEG", quality=78)
+                file.thumbnail_path = str(derivative / "thumbnail.jpg")
+                file.save(update_fields=["thumbnail_path"])
+                visual_image = image.copy()
+                visual_image.thumbnail((1024, 1024))
                 visual = derivative / "visual.jpg"
-                image.save(visual, "JPEG", quality=85)
+                visual_image.save(visual, "JPEG", quality=85)
                 segments = [{"ordinal": 0, "representation": "visual", "derivative_path": str(visual)}]
                 try:
                     import pytesseract
-                    words = pytesseract.image_to_string(image).split()
-                    if len(words) >= 15:
-                        for part in _text_segments(" ".join(words), max_chars=_text_budget()):
+                    ocr_image = image.copy()
+                    ocr_image.thumbnail((2400, 2400))
+                    data = pytesseract.image_to_data(ocr_image, output_type=pytesseract.Output.DICT)
+                    tokens = [(word.strip(), float(conf)) for word, conf in zip(data["text"], data["conf"])
+                              if word.strip() and float(conf) >= 35]
+                    if tokens:
+                        confidence = sum(conf for _, conf in tokens) / len(tokens)
+                        for part in _text_segments(" ".join(word for word, _ in tokens), max_chars=_text_budget(),
+                                                   title=file.original_name):
                             part["representation"] = "ocr_text"
+                            part["ordinal"] = len(segments)
+                            part["ocr_confidence"] = confidence
                             segments.append(part)
                 except Exception:
                     pass  # OCR is optional enrichment; visual indexing still proceeds.

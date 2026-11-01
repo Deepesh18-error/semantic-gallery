@@ -145,15 +145,20 @@ def serve_media_file(request, media_id):
     if file is None:
         return HttpResponse(status=404)
     thumbnail = request.GET.get("thumbnail") == "true"
-    path = Path(file.thumbnail_path if thumbnail and file.source_type != "IMAGE" else file.path)
+    path = Path(file.thumbnail_path if thumbnail and file.thumbnail_path else file.path)
     if thumbnail and file.source_type not in ("IMAGE", "VIDEO", "DOCUMENT"):
         return HttpResponse(status=404)
     if not path.is_file():
         return HttpResponse(status=404)
-    allowed_root = Path(settings.MEDIA_VAULT).resolve() if file.source.kind == "managed_import" else Path(file.source.root_path).resolve()
+    allowed_root = (Path(settings.MEDIA_VAULT).resolve() if thumbnail and file.thumbnail_path
+                    else Path(settings.MEDIA_VAULT).resolve() if file.source.kind == "managed_import"
+                    else Path(file.source.root_path).resolve())
     if not path.resolve().is_relative_to(allowed_root):
         return HttpResponse(status=404)
-    return FileResponse(path.open("rb"), content_type="image/jpeg" if thumbnail and file.source_type != "IMAGE" else file.mime_type)
+    if thumbnail and file.source_type == "IMAGE" and file.thumbnail_path and not path.resolve().is_relative_to(
+            (Path(settings.MEDIA_VAULT) / "derivatives" / file.id / str(file.current_version_id)).resolve()):
+        return HttpResponse(status=404)
+    return FileResponse(path.open("rb"), content_type="image/jpeg" if thumbnail and file.thumbnail_path else file.mime_type)
 
 
 @api_view(["DELETE"])
@@ -361,10 +366,16 @@ def search_media(request):
                     "file_size_bytes": file.size_bytes, "mime_type": file.mime_type,
                     "similarity_percentage": round(score * 100),
                     "availability": "available" if file.available else "missing",
-                    "indexing_coverage": {"status": file.processing_status, "partial": file.processing_status == "PARTIALLY_EMBEDDED"},
+                    "indexing_coverage": {"status": file.processing_status,
+                        "partial": file.processing_status == "PARTIAL",
+                        **(file.current_version.extraction_coverage if file.current_version else {})},
                     "representation": segment.representation if segment else "legacy_vector",
                     "evidence_source": "full_text" if segment and segment.text else "vector",
-                    "matched_chunk_preview": segment.text[:300] if segment else ""})
+                    "matched_chunk_preview": segment.text[:300] if segment else "",
+                    "location": {"page_number": segment.page_number,
+                        "source_start": segment.source_start, "source_end": segment.source_end,
+                        "start_seconds": segment.start_seconds,
+                        "end_seconds": segment.end_seconds} if segment else None})
         results.append(row)
     elapsed = round((time.perf_counter() - started) * 1000, 2)
     return Response({"schema_version": SEARCH_SCHEMA_VERSION, "query": search.query,

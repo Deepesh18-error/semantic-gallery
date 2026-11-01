@@ -118,6 +118,10 @@ class CatalogWorker:
             if not parts:
                 raise ExtractionError("extraction_failed", "No searchable content was extracted")
             with transaction.atomic():
+                coverage = getattr(parts, "coverage", {})
+                if coverage:
+                    version.extraction_coverage = coverage
+                    version.save(update_fields=["extraction_coverage"])
                 keys = set()
                 for part in parts:
                     segment = self.catalog.put_segment(file_version_id=version.id, **part)
@@ -165,7 +169,7 @@ class CatalogWorker:
                 file.refresh_from_db()
                 if file.current_version_id != version.id:
                     raise StaleFile("File changed before publication")
-                file.processing_status = "EMBEDDED"
+                file.processing_status = "PARTIAL" if version.extraction_coverage.get("failed_pages") else "EMBEDDED"
                 file.error_message = ""
                 file.save(update_fields=["processing_status", "error_message"])
             return

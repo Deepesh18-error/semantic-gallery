@@ -84,6 +84,11 @@ class SQLiteCatalog:
             file_version_id=file_version_id, ordinal=ordinal, representation=representation,
             defaults={"text": text, "derivative_path": derivative_path,
                       "page_number": location.get("page_number"),
+                      "source_start": location.get("source_start"),
+                      "source_end": location.get("source_end"),
+                      "heading": location.get("heading", ""),
+                      "title": location.get("title", ""),
+                      "ocr_confidence": location.get("ocr_confidence"),
                       "start_seconds": location.get("start_seconds"),
                       "end_seconds": location.get("end_seconds")})
         return segment

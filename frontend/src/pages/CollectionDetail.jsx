@@ -25,7 +25,7 @@ const SmartMediaPreview = ({ mediaId, mediaType, processingStatus }) => {
 
     // Don't fetch until AI pipeline is fully done
     // This prevents 404s on thumbnails that haven't been generated yet
-    if (!['EMBEDDED', 'PARTIALLY_EMBEDDED'].includes(processingStatus)) {
+    if (!['EMBEDDED', 'PARTIAL', 'PARTIALLY_EMBEDDED'].includes(processingStatus)) {
       setLoading(false);
       return;
     }
@@ -37,9 +37,7 @@ const SmartMediaPreview = ({ mediaId, mediaType, processingStatus }) => {
         // IMAGE  → serve the actual image file directly (no thumbnail needed)
         // VIDEO  → serve the generated JPG thumbnail from media_vault/thumbnails/
         // DOCUMENT (PDF) → serve the generated JPG thumbnail from media_vault/thumbnails/
-        const url = mediaType === 'IMAGE'
-          ? `/media/file/${mediaId}/`
-          : `/media/file/${mediaId}/?thumbnail=true`;
+        const url = `/media/file/${mediaId}/?thumbnail=true`;
 
         const response = await api.get(url, { responseType: 'blob' });
         objectUrl = URL.createObjectURL(response.data);

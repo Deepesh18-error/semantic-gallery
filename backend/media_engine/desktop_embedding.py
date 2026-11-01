@@ -15,7 +15,9 @@ def embed_segment(segment, user_id):
     if not os.getenv("GOOGLE_API_KEY"):
         raise QuotaError("credentials")
     if segment.representation in ("text", "ocr_text"):
-        content = f"title: {segment.file_version.file.original_name} | text: {segment.text}"
+        title = segment.title or segment.file_version.file.original_name
+        heading = f"{segment.heading}\n" if segment.heading else ""
+        content = f"title: {title} | text: {heading}{segment.text}"
         estimate = max(1, len(content) // 4)
     else:
         path = Path(segment.derivative_path)
