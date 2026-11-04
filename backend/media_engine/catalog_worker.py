@@ -4,12 +4,15 @@ import logging
 import os
 import threading
 import time
+import shutil
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from uuid import uuid4
 
 from django.db import close_old_connections, transaction
 from django.db.models import Q
+from django.db.models import F
+from django.conf import settings
 from django.utils import timezone
 
 from .catalog_store import SQLiteCatalog, SQLiteJobScheduler
@@ -59,6 +62,17 @@ class CatalogWorker:
         if file.current_version_id != version.id:
             raise StaleFile("A newer file version exists")
         path = Path(file.path)
+        from .source_sync import is_link, _excluded
+        root = Path(file.source.root_path)
+        if file.source.kind == "linked_folder" and (
+                _excluded(path, root, file.source) or (not file.source.recursive and path.parent != root)):
+            CatalogFile.objects.filter(pk=file.id).update(available=False)
+            raise ExtractionError("source_excluded", "File is excluded by source settings")
+        for candidate in (path, *path.parents):
+            if candidate.exists() and is_link(candidate):
+                raise ExtractionError("unsupported_format", "Symlinks and junctions are excluded")
+            if candidate == root:
+                break
         if not path.resolve().is_relative_to(Path(file.source.root_path).resolve()):
             raise ExtractionError("unsupported_format", "Source path escaped its linked folder")
         if not path.is_file():
@@ -70,6 +84,11 @@ class CatalogWorker:
         if hash_file or stat.st_size != version.size_bytes or stat.st_mtime_ns != version.modified_ns:
             fingerprint = self._fingerprint(path)
             if version.fingerprint and fingerprint != version.fingerprint:
+                if file.source.kind == "linked_folder":
+                    from .models import CatalogSource
+                    CatalogFile.objects.filter(pk=file.id).update(processing_status="WAITING_FOR_FILE")
+                    CatalogSource.objects.filter(pk=file.source_id).update(next_scan_at=timezone.now())
+                    raise StaleFile("File changed; folder synchronization will wait for a stable write")
                 self.catalog.put_file(file_id=file.id, user_id=file.user_id,
                     source_id=file.source_id, path=file.path, source_type=file.source_type,
                     mime_type=file.mime_type, fingerprint=fingerprint,
@@ -108,8 +127,33 @@ class CatalogWorker:
             return
         if job.stage == "extract":
             before = Path(file.path).stat()
+            if file.source_type == "AUDIO":
+                from .audio_transcription import transcription_config
+                extraction_config = transcription_config()
+            else:
+                extraction_config = f"phase4-v1:p{os.getenv('SEMANTIC_GALLERY_PASSAGE_TOKENS', '600')}"
+            donor = CatalogFileVersion.objects.filter(fingerprint=version.fingerprint,
+                file__user_id=file.user_id, file__source_type=file.source_type,
+                file__published_version_id=F("id"),
+                extraction_coverage__extraction_config=extraction_config).exclude(pk=version.pk).first()
+            if donor and (donor.extraction_coverage.get("failed_pages") or
+                          donor.extraction_coverage.get("failed_intervals")):
+                donor = None
             with self.resources.cpu, self.resources.disk:
-                parts = extract(file)
+                parts = self._reuse_extraction(donor, version, file) if donor else None
+                if not parts:
+                    if file.source_type == "AUDIO":
+                        from .audio_transcription import extract_audio
+                        def report_audio_progress(done, total):
+                            if self.scheduler.stop_requested(job.id, self.owner):
+                                raise StoppedJob("Audio extraction stopped")
+                            if not CatalogFile.objects.filter(pk=file.id,
+                                    current_version_id=version.id, available=True).exists():
+                                raise StaleFile("Audio file changed or disappeared during extraction")
+                            self.scheduler.set_progress(job.id, self.owner, done, total)
+                        parts = extract_audio(file, progress=report_audio_progress)
+                    else:
+                        parts = extract(file)
             after = Path(file.path).stat()
             if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
                 # Metadata can change without changing the bytes. _ensure_current
@@ -118,10 +162,13 @@ class CatalogWorker:
             if not parts:
                 raise ExtractionError("extraction_failed", "No searchable content was extracted")
             with transaction.atomic():
-                coverage = getattr(parts, "coverage", {})
-                if coverage:
-                    version.extraction_coverage = coverage
-                    version.save(update_fields=["extraction_coverage"])
+                if not CatalogJob.objects.filter(pk=job.id, state="running", lease_owner=self.owner,
+                        lease_until__gt=timezone.now()).exists():
+                    raise StoppedJob("Lease lost before extraction commit")
+                coverage = dict(getattr(parts, "coverage", {}))
+                coverage["extraction_config"] = extraction_config
+                version.extraction_coverage = coverage
+                version.save(update_fields=["extraction_coverage"])
                 keys = set()
                 for part in parts:
                     segment = self.catalog.put_segment(file_version_id=version.id, **part)
@@ -169,17 +216,52 @@ class CatalogWorker:
                     for segment in segments):
                 raise ExtractionError("extraction_failed", "Not all segments have vectors")
             with transaction.atomic():
+                if not CatalogJob.objects.filter(pk=job.id, state="running", lease_owner=self.owner,
+                        lease_until__gt=timezone.now()).exists():
+                    raise StoppedJob("Lease lost before publication")
                 if CatalogJob.objects.filter(pk=job.id).filter(
                         Q(cancel_requested=True) | Q(pause_requested=True)).exists():
                     raise StoppedJob("Job stopped before publication")
                 file.refresh_from_db()
                 if file.current_version_id != version.id:
                     raise StaleFile("File changed before publication")
-                file.processing_status = "PARTIAL" if version.extraction_coverage.get("failed_pages") else "EMBEDDED"
+                file.processing_status = "PARTIAL" if (version.extraction_coverage.get("failed_pages") or
+                    version.extraction_coverage.get("failed_intervals")) else "EMBEDDED"
                 file.error_message = ""
-                file.save(update_fields=["processing_status", "error_message"])
+                file.published_version_id = version.id
+                file.thumbnail_path = version.thumbnail_path or file.thumbnail_path
+                file.save(update_fields=["processing_status", "error_message", "published_version", "thumbnail_path"])
             return
         raise ValueError(f"Unknown stage: {job.stage}")
+
+    def _reuse_extraction(self, donor, version, file):
+        from .desktop_extraction import ExtractedSegments
+        segments = list(CatalogSegment.objects.filter(file_version=donor))
+        if not segments:
+            return None
+        paths = [Path(segment.derivative_path) for segment in segments if segment.derivative_path]
+        vault = Path(settings.MEDIA_VAULT).resolve()
+        if any(not path.is_file() or not path.resolve().is_relative_to(vault) for path in paths):
+            return None
+        destination = vault / "derivatives" / file.id / str(version.id)
+        destination.mkdir(parents=True, exist_ok=True)
+        parts = []
+        for segment in segments:
+            part = {key: getattr(segment, key) for key in ("ordinal", "representation", "text",
+                "page_number", "source_start", "source_end", "heading", "title", "ocr_confidence",
+                "start_seconds", "end_seconds")}
+            if part["title"] == donor.file.original_name:
+                part["title"] = file.original_name
+            if segment.derivative_path:
+                target = destination / Path(segment.derivative_path).name
+                shutil.copy2(segment.derivative_path, target)
+                part["derivative_path"] = str(target)
+            parts.append(part)
+        if donor.thumbnail_path and Path(donor.thumbnail_path).is_file() and Path(donor.thumbnail_path).resolve().is_relative_to(vault):
+            target = destination / "thumbnail.jpg"
+            shutil.copy2(donor.thumbnail_path, target)
+            CatalogFileVersion.objects.filter(pk=version.pk).update(thumbnail_path=str(target))
+        return ExtractedSegments(parts, coverage=dict(donor.extraction_coverage))
 
     def _heartbeat(self, job_id, stop):
         close_old_connections()
@@ -243,7 +325,7 @@ class CatalogWorker:
                 delay = min(3600, max(getattr(error, "retry_seconds", 0),
                     retry_after(error) if category == "rate_limit" else 0, 2 ** min(job.attempts, 8)))
             self.scheduler.fail(job.id, self.owner, category=category, message=str(error), retry_seconds=delay)
-            if job.stage != "enrich" and category in ("unsupported_format", "extraction_failed", "missing_file", "credentials", "daily_budget", "quota_unconfigured", "input_too_large", "provider_rejected"):
+            if job.stage != "enrich" and category in ("unsupported_format", "source_excluded", "extraction_failed", "transcription_failed", "transcriber_unavailable", "no_speech", "missing_file", "credentials", "daily_budget", "quota_unconfigured", "input_too_large", "provider_rejected"):
                 file = job.file_version.file
                 file.processing_status = "PAUSED" if category in ("credentials", "daily_budget", "quota_unconfigured") else "UNSUPPORTED" if category == "unsupported_format" else "FAILED"
                 file.error_message = f"{category}: {error}"

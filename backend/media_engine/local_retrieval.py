@@ -51,7 +51,7 @@ class SQLiteExactVectors:
                  JOIN media_engine_catalogfile f ON f.id = v.file_id
                  WHERE r.backend = %s AND r.model_config = %s AND r.index_generation = %s
                    AND r.dimensions = %s AND r.vector_blob IS NOT NULL
-                   AND f.user_id = %s AND f.available = 1 AND f.current_version_id = v.id"""
+                   AND f.user_id = %s AND f.available = 1 AND COALESCE(f.published_version_id, f.current_version_id) = v.id"""
         params = [self.backend, model_config, generation, len(needle), user_id]
         if source_type:
             sql += " AND f.source_type = %s"
@@ -95,7 +95,7 @@ class SQLiteExactVectors:
                  JOIN media_engine_catalogfile f ON f.id=v.file_id
                  WHERE r.backend='sqlite_exact' AND r.model_config=%s AND r.index_generation=%s
                    AND r.dimensions=%s AND r.vector_blob IS NOT NULL
-                   AND f.user_id=%s AND f.available=1 AND f.current_version_id=v.id
+                   AND f.user_id=%s AND f.available=1 AND COALESCE(f.published_version_id,f.current_version_id)=v.id
                    AND s.representation IN ('visual','text','ocr_text','transcript','audio','video')"""
         params = [model_config, generation, len(needle), user_id]
         if source_type:
@@ -151,7 +151,7 @@ class SQLiteFullText:
                  JOIN media_engine_catalogfileversion v ON v.id=s.file_version_id
                  JOIN media_engine_catalogfile f ON f.id=v.file_id
                  WHERE catalog_search_fts MATCH %s AND f.user_id=%s
-                   AND f.available=1 AND f.current_version_id=v.id"""
+                   AND f.available=1 AND COALESCE(f.published_version_id,f.current_version_id)=v.id"""
         params = [expression, user_id]
         if source_type:
             sql += " AND f.source_type=%s"
@@ -167,12 +167,20 @@ class SQLiteFullText:
             cursor.execute(sql, params)
             while rows := cursor.fetchmany(128):
                 for segment_id, file_id, representation, page, rank, filename, title, heading, text in rows:
-                    haystack = " ".join((filename or "", title or "", heading or "", text or "")).casefold()
-                    matches = sum(term in haystack for term in terms)
+                    fields = {name: set(re.findall(r"\w+", (value or "").casefold()))
+                              for name, value in (("filename", filename), ("title", title),
+                                                  ("heading", heading), ("passage", text))}
+                    field_matches = {name: sum(term in tokens for term in terms)
+                                     for name, tokens in fields.items()}
+                    matches = sum(any(term in tokens for tokens in fields.values()) for term in terms)
                     row = {"segment_id": segment_id, "file_id": file_id,
                            "representation": representation, "page_number": page,
                            "bm25": rank, "matched_terms": matches,
-                           "query_terms": len(terms), "filename": filename}
+                           "query_terms": len(terms), "filename": filename,
+                           "passage_terms": field_matches["passage"],
+                           "heading_terms": field_matches["heading"],
+                           "title_terms": field_matches["title"],
+                           "filename_terms": field_matches["filename"]}
                     bucket = grouped.setdefault(file_id, [])
                     bucket.append(row)
                     bucket.sort(key=lambda item: (-item["matched_terms"], item["bm25"]))
@@ -191,7 +199,7 @@ class SQLiteFullText:
                  JOIN media_engine_catalogfileversion v ON v.id = s.file_version_id
                  JOIN media_engine_catalogfile f ON f.id = v.file_id
                  WHERE catalog_segment_fts MATCH %s AND f.user_id = %s
-                   AND f.available = 1 AND f.current_version_id = v.id"""
+                   AND f.available = 1 AND COALESCE(f.published_version_id, f.current_version_id) = v.id"""
         params = [expression, user_id]
         if source_type:
             sql += " AND f.source_type = %s"

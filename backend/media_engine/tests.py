@@ -58,3 +58,12 @@ class AccessTests(SimpleTestCase):
             response = views.search_media(request)
             self.assertEqual(response.status_code, 429)
             self.assertEqual(response.data["code"], "RATE_LIMITED")
+
+    def test_legacy_local_suggestions_never_call_search_provider(self):
+        with patch("media_engine.auth_service.jwt.decode", return_value={"user_id": "alice"}), \
+             patch.object(views, "db") as db, patch.object(views, "execute_search") as search:
+            db.media_items.find.return_value.limit.return_value = []
+            request = self.factory.post("/api/search/", {"query": "burger", "mode": "local"}, format="json", **self.auth)
+            response = views.search_media(request)
+            self.assertEqual(response.status_code, 200)
+            search.assert_not_called()

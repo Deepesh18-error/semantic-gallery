@@ -27,12 +27,15 @@ const SearchResultCard = ({ result, onClick }) => {
     }
 
     let objectUrl = null;
+    let alive = true;
+    const controller = new AbortController();
     const fetchThumb = async () => {
       const previewStarted = performance.now();
       try {
         const url = `/media/file/${result.media_item_id}/?thumbnail=true`;
 
-        const res = await api.get(url, { responseType: 'blob' });
+        const res = await api.get(url, { responseType: 'blob', signal: controller.signal });
+        if (!alive) return;
         objectUrl = URL.createObjectURL(res.data);
         setThumbUrl(objectUrl);
         console.info('[SEARCH_UI_METRICS]', JSON.stringify({
@@ -40,14 +43,18 @@ const SearchResultCard = ({ result, onClick }) => {
           preview_fetch_ms: Math.round(performance.now() - previewStarted)
         }));
       } catch (err) {
-        console.warn("Thumb fetch failed", err);
+        if (!controller.signal.aborted) console.warn("Thumb fetch failed", err);
       } finally {
-        setLoading(false);
+        if (alive) setLoading(false);
       }
     };
 
     fetchThumb();
-    return () => objectUrl && URL.revokeObjectURL(objectUrl);
+    return () => {
+      alive = false;
+      controller.abort();
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    };
   }, [result.media_item_id, result.media_type]);
 
   // --- 2. DYNAMIC BADGE COLORING ---
@@ -63,6 +70,8 @@ const SearchResultCard = ({ result, onClick }) => {
       onClick={() => onClick(result)}
       className="group bg-white rounded-[40px] border border-slate-100 overflow-hidden shadow-sm hover:shadow-2xl hover:border-brand/20 transition-all cursor-pointer flex flex-col"
     >
+      {result.indexing_coverage?.stale && <p className="px-4 py-2 text-xs text-amber-800 bg-amber-50">Updating index — showing previous evidence</p>}
+      {result.media_type === 'AUDIO' && result.indexing_coverage?.partial && <p className="px-4 py-2 text-xs text-amber-800 bg-amber-50">Transcript has missing intervals</p>}
       {/* THUMBNAIL AREA */}
       <div className="relative aspect-[4/3] bg-slate-50 flex items-center justify-center overflow-hidden">
         
@@ -72,6 +81,8 @@ const SearchResultCard = ({ result, onClick }) => {
         ) : thumbUrl ? (
           <img 
             src={thumbUrl} 
+            loading="lazy"
+            decoding="async"
             alt="Result Preview" 
             className="w-full h-full object-cover group-hover:scale-110 transition-transform duration-700" 
           />
@@ -99,7 +110,7 @@ const SearchResultCard = ({ result, onClick }) => {
         )}
 
         {/* Deep Link Badge (Bottom Left - Video/Audio) */}
-        {(result.media_type === 'VIDEO' || result.media_type === 'AUDIO') && (
+        {(result.media_type === 'VIDEO' || result.media_type === 'AUDIO') && result.matched_segment_start_time != null && (
           <div className="absolute bottom-4 left-4 bg-slate-900/80 backdrop-blur-md text-white px-3 py-1.5 rounded-xl flex items-center gap-2 text-[10px] font-black">
              <Clock className="w-3 h-3 text-brand" />
              Match at {formatTime(result.matched_segment_start_time)}

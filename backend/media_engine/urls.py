@@ -9,6 +9,8 @@ if os.getenv("SEMANTIC_GALLERY_STORAGE", "legacy").lower() == "desktop":
         get_search_history, retry_all_pending,
         control_job,
         provider_usage,
+        sources, source_settings,
+        audio_playback_link, stream_audio,
     )
 else:
     from .views import (
@@ -51,5 +53,9 @@ urlpatterns = [
 ]
 
 if os.getenv("SEMANTIC_GALLERY_STORAGE", "legacy").lower() == "desktop":
+    urlpatterns.append(path('sources/', sources))
+    urlpatterns.append(path('sources/<str:source_id>/', source_settings))
     urlpatterns.append(path('media/jobs/<str:job_id>/<str:action>/', control_job))
     urlpatterns.append(path('provider/usage/', provider_usage))
+    urlpatterns.append(path('media/file/<str:media_id>/playback-link/', audio_playback_link))
+    urlpatterns.append(path('media/file/<str:media_id>/stream/', stream_audio))

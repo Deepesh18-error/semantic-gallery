@@ -8,6 +8,7 @@ import api from '../services/api';
 import toast from 'react-hot-toast';
 import { motion } from 'framer-motion';
 import { useCollectionStore } from '../store/collectionStore';
+import LinkedSources from './LinkedSources';
 
 const Settings = () => {
   const navigate = useNavigate();
@@ -15,6 +16,7 @@ const Settings = () => {
   
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
+  const [desktopSources, setDesktopSources] = useState(false);
   
   // Settings State
   const [settings, setSettings] = useState({
@@ -27,6 +29,18 @@ const Settings = () => {
   // --- 1. FETCH CURRENT SETTINGS ---
   useEffect(() => {
     const fetchSettings = async () => {
+      try {
+        await api.get('/sources/');
+        setDesktopSources(true);
+        setLoading(false);
+        return;
+      } catch (failure) {
+        if (failure.response?.status !== 404) {
+          toast.error('Folder settings could not be loaded.');
+          setLoading(false);
+          return;
+        }
+      }
       try {
         const res = await api.get('/settings/'); // You'll need to build this endpoint
         if (res.data) setSettings(res.data);
@@ -72,6 +86,7 @@ const Settings = () => {
     }
   };
 
+  if (desktopSources) return <LinkedSources />;
   if (loading) return <div className="min-h-screen flex items-center justify-center bg-slate-50"><Loader2 className="animate-spin text-brand" /></div>;
 
   return (

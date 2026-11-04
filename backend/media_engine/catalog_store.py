@@ -40,6 +40,9 @@ class SQLiteCatalog:
         existing = CatalogFile.objects.filter(pk=file_id).first()
         if existing and existing.user_id != user_id:
             raise ValueError("File belongs to another user")
+        if existing and existing.published_version_id is None and existing.processing_status in ("EMBEDDED", "PARTIAL"):
+            existing.published_version_id = existing.current_version_id
+            existing.save(update_fields=["published_version"])
         resolved = Path(path).resolve()
         root = Path(source.root_path).resolve()
         if not resolved.is_relative_to(root):
@@ -54,9 +57,9 @@ class SQLiteCatalog:
                                   "available": stat is not None,
                                   "processing_status": metadata.get("processing_status", "PENDING"),
                                   "error_message": metadata.get("error_message", ""),
-                                  "thumbnail_path": metadata.get("thumbnail_path", ""),
-                                  "ai_description": metadata.get("ai_description", ""),
-                                  "description_status": metadata.get("description_status", "PENDING")})
+                                  "thumbnail_path": metadata.get("thumbnail_path", existing.thumbnail_path if existing else ""),
+                                  "ai_description": metadata.get("ai_description", existing.ai_description if existing else ""),
+                                  "description_status": metadata.get("description_status", existing.description_status if existing else "PENDING")})
         current = file.current_version
         if current is None or (fingerprint and current.fingerprint != fingerprint) or (
                 not fingerprint and current.modified_ns != file.modified_ns):
@@ -72,6 +75,21 @@ class SQLiteCatalog:
 
     def get_file(self, file_id, user_id):
         return CatalogFile.objects.filter(id=file_id, user_id=user_id).select_related("current_version").first()
+
+    @transaction.atomic
+    def queue_reindex(self, file_id, user_id):
+        file = CatalogFile.objects.select_related("current_version").get(pk=file_id, user_id=user_id)
+        active = CatalogJob.objects.filter(file_version=file.current_version, state__in=["queued", "running", "paused"]).first()
+        if active:
+            return active.id
+        if file.published_version_id or file.processing_status in ("EMBEDDED", "PARTIAL"):
+            previous = file.current_version
+            file.published_version_id = file.published_version_id or previous.id
+            file.current_version = CatalogFileVersion.objects.create(file=file, generation=previous.generation + 1,
+                fingerprint=previous.fingerprint, size_bytes=previous.size_bytes, modified_ns=previous.modified_ns)
+        file.processing_status = "PENDING"
+        file.save(update_fields=["current_version", "published_version", "processing_status"])
+        return SQLiteJobScheduler().enqueue(file.current_version_id, "discover")
 
     def list_files(self, user_id, collection_id=None):
         files = CatalogFile.objects.filter(user_id=user_id).select_related("current_version")
@@ -125,6 +143,7 @@ class SQLiteJobScheduler:
             Q(state="queued", next_retry_at__lte=now) |
             Q(state="running", lease_until__lte=now),
             pause_requested=False, cancel_requested=False,
+            file_version__file__source__paused=False,
             attempts__lt=F("max_attempts")).order_by("priority", "created_at")[:16]
         lease_until = now + timedelta(seconds=lease_seconds)
         for candidate in candidates:
@@ -134,6 +153,7 @@ class SQLiteJobScheduler:
                     Q(state="queued", next_retry_at__lte=now) |
                     Q(state="running", lease_until__lte=now),
                     pause_requested=False, cancel_requested=False,
+                    file_version__file__source__paused=False,
                     attempts__lt=F("max_attempts")).update(
                         state="running", lease_owner=owner, lease_until=lease_until,
                         attempts=F("attempts") + 1)
@@ -210,6 +230,10 @@ class SQLiteJobScheduler:
         if job.pause_requested:
             CatalogJob.objects.filter(pk=job_id, lease_owner=owner).update(
                 state="paused", lease_owner="", lease_until=None)
+            return "paused"
+        if job.file_version.file.source.paused:
+            CatalogJob.objects.filter(pk=job_id, lease_owner=owner).update(
+                state="paused", error_category="source_paused", lease_owner="", lease_until=None)
             return "paused"
         return None
 

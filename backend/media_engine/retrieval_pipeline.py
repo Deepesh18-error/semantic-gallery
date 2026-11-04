@@ -1,9 +1,6 @@
 """Local constraint parsing, file-level rank fusion and final relevance policy."""
-import os
 import re
 from collections import defaultdict
-
-from django.db.models import Q
 
 from .models import CatalogFile
 
@@ -72,6 +69,10 @@ def fuse(keyword_hits, semantic_groups, exact_filenames):
         for row in rows:
             file_id = row["file_id"]
             if file_id in seen:
+                if channel == "keyword":
+                    details = files[file_id]["channels"][channel]
+                    for field in ("matched_terms", "passage_terms", "heading_terms", "title_terms", "filename_terms"):
+                        details[field] = max(details.get(field) or 0, row.get(field) or 0)
                 if row.get("segment_id") and sum(e["channel"] == channel for e in files[file_id]["evidence"]) < 2:
                     files[file_id]["evidence"].append({"channel": channel, **row})
                 continue
@@ -84,22 +85,11 @@ def fuse(keyword_hits, semantic_groups, exact_filenames):
                                            "raw_score": row.get("score"),
                                            "bm25": row.get("bm25"),
                                            "matched_terms": row.get("matched_terms"),
-                                           "query_terms": row.get("query_terms")}
+                                           "query_terms": row.get("query_terms"),
+                                           "passage_terms": row.get("passage_terms"),
+                                           "heading_terms": row.get("heading_terms"),
+                                           "title_terms": row.get("title_terms"),
+                                           "filename_terms": row.get("filename_terms")}
             if row.get("segment_id"):
                 entry["evidence"].append({"channel": channel, **row})
     return files
-
-
-def relevant(entry):
-    """Final policy: lexical coverage or calibrated semantic similarity.
-
-    Threshold is an explicit tuning input pending the live Phase 0 evaluation.
-    """
-    if "filename" in entry["channels"]:
-        return True
-    keyword = entry["channels"].get("keyword")
-    if keyword and keyword.get("matched_terms") == keyword.get("query_terms"):
-        return True
-    floor = float(os.getenv("SEMANTIC_GALLERY_SEMANTIC_FLOOR", "0.5"))
-    return any(channel.startswith("semantic:") and details.get("raw_score", -1) >= floor
-               for channel, details in entry["channels"].items())

@@ -12,9 +12,9 @@ class Command(BaseCommand):
     def add_arguments(self, parser):
         parser.add_argument("--once", action="store_true", help="Run at most one stage")
         parser.add_argument("--drain", action="store_true", help="Run ready stages until idle")
-        parser.add_argument("--concurrency", type=int, default=2)
-        parser.add_argument("--cpu", type=int, default=2)
-        parser.add_argument("--disk", type=int, default=2)
+        parser.add_argument("--concurrency", type=int, default=1)
+        parser.add_argument("--cpu", type=int, default=1)
+        parser.add_argument("--disk", type=int, default=1)
         parser.add_argument("--network", type=int, default=1)
 
     def handle(self, *args, **options):

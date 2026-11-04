@@ -16,6 +16,17 @@ class CatalogSource(models.Model):
     kind = models.CharField(max_length=24)
     root_path = models.TextField()
     state = models.CharField(max_length=24, default="active")
+    paused = models.BooleanField(default=False)
+    exclusions = models.JSONField(default=list, blank=True)
+    recursive = models.BooleanField(default=True)
+    settle_seconds = models.PositiveIntegerField(default=2)
+    scan_interval_seconds = models.PositiveIntegerField(default=5)
+    collection = models.ForeignKey("CatalogCollection", null=True, blank=True, on_delete=models.SET_NULL)
+    last_scan_at = models.DateTimeField(null=True)
+    next_scan_at = models.DateTimeField(null=True)
+    error = models.TextField(blank=True)
+    lease_owner = models.CharField(max_length=128, blank=True)
+    lease_until = models.DateTimeField(null=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
@@ -49,6 +60,8 @@ class CatalogFile(models.Model):
     ai_description = models.TextField(blank=True)
     description_status = models.CharField(max_length=32, default="PENDING")
     current_version = models.ForeignKey("CatalogFileVersion", null=True, blank=True, on_delete=models.SET_NULL, related_name="+")
+    published_version = models.ForeignKey("CatalogFileVersion", null=True, blank=True, on_delete=models.SET_NULL, related_name="+")
+    file_identity = models.CharField(max_length=128, blank=True, db_index=True)
     collections = models.ManyToManyField(CatalogCollection, through="CatalogMembership", related_name="files")
     created_at = models.DateTimeField(auto_now_add=True)
 
@@ -64,10 +77,23 @@ class CatalogFileVersion(models.Model):
     size_bytes = models.BigIntegerField(default=0)
     modified_ns = models.BigIntegerField(null=True)
     extraction_coverage = models.JSONField(default=dict, blank=True)
+    thumbnail_path = models.TextField(blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
         constraints = [models.UniqueConstraint(fields=["file", "generation"], name="unique_file_generation")]
+
+
+class SourceObservation(models.Model):
+    source = models.ForeignKey(CatalogSource, on_delete=models.CASCADE)
+    path = models.TextField()
+    size_bytes = models.BigIntegerField()
+    modified_ns = models.BigIntegerField()
+    file_identity = models.CharField(max_length=128, blank=True)
+    stable_since = models.DateTimeField()
+
+    class Meta:
+        constraints = [models.UniqueConstraint(fields=["source", "path"], name="unique_source_observation")]
 
 
 class CatalogMembership(models.Model):

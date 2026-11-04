@@ -3,7 +3,7 @@ import os
 
 from django.core.management.base import BaseCommand, CommandError
 
-from media_engine.catalog_store import SQLiteJobScheduler
+from media_engine.catalog_store import SQLiteCatalog
 from media_engine.desktop_embedding import INDEX_GENERATION, MODEL_CONFIG
 from media_engine.models import CatalogFile, CatalogJob, CatalogSegment, CatalogVectorRecord
 
@@ -41,7 +41,7 @@ class Command(BaseCommand):
                 continue
             count += 1
             if options["enqueue"]:
-                SQLiteJobScheduler().enqueue(file.current_version_id, "discover")
+                SQLiteCatalog().queue_reindex(file.id, file.user_id)
                 queued += 1
             if count >= options["limit"]:
                 break

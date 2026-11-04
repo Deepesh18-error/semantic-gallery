@@ -34,7 +34,10 @@ def score_case(case, response):
         "type_violation": any(r.get("media_type") != case["file_type"] for r in response.get("results", [])) if case.get("file_type") else None,
         "requires_review": bool(case.get("requires_review")),
         "index_generation": response.get("index_generation"),
+        "index_config": response.get("index_config"),
         "candidate_debug": response.get("candidate_debug"),
+        "candidate_pool_count": response.get("candidate_pool_count"),
+        "candidate_debug_truncated": response.get("candidate_debug_truncated"),
         "metrics": response.get("metrics"),
     }
 
@@ -119,8 +122,12 @@ def main():
         generations = {row.get("index_generation") for row in rows}
         if len(generations) != 1:
             raise ValueError("Index generation changed during evaluation")
+        configurations = {row.get("index_config") for row in rows}
+        if len(configurations) != 1:
+            raise ValueError("Index configuration changed during evaluation")
         report = {"mode": args.mode, "collection_id": args.collection_id, "summary": summarize(rows), "cases": rows,
                   "index_generation": generations.pop(),
+                  "index_config": configurations.pop(),
                   "note": "Cold, cached, and indexing-load labels require separate controlled runs. Missing-answer judgments require human review."}
     output = json.dumps(report, indent=2)
     if args.output:

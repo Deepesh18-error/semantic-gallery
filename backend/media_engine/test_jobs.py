@@ -19,12 +19,12 @@ class DurablePipelineTests(TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.override = override_settings(MEDIA_VAULT=Path(self.temp.name))
+        self.override = override_settings(MEDIA_VAULT=Path(self.temp.name) / "vault")
         self.override.enable()
         self.addCleanup(self.override.disable)
         self.root = Path(self.temp.name)
         self.store = SQLiteCatalog()
-        self.store.put_source(source_id="source", user_id="alice", kind="linked_folder", root_path=self.root)
+        self.store.put_source(source_id="source", user_id="alice", kind="managed_import", root_path=self.root)
         self.path = self.root / "notes.txt"
         self.path.write_text("burger recipe with fries", encoding="utf-8")
         self.file = self.store.put_file(file_id="file", user_id="alice", source_id="source",
@@ -174,7 +174,7 @@ class EmbeddingRequestTests(TestCase):
         client = MagicMock()
         client.models.embed_content.return_value = response
         with patch.dict(os.environ, {"GOOGLE_API_KEY": "test"}), \
-             patch("media_engine.desktop_embedding.genai.Client", return_value=client), \
+             patch("media_engine.desktop_embedding.provider_client", return_value=client), \
              patch("media_engine.desktop_embedding.call_with_quota",
                    side_effect=lambda model, operation, estimate, fn, **kwargs: fn()):
             self.assertEqual(embed_query("burger", "alice"), [1] + [0] * (DIMENSIONS - 1))

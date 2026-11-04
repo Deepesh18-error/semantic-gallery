@@ -17,23 +17,37 @@ const SearchResultModal = ({ result, onClose, onFindSimilar }) => {
 
   // --- 1. FETCH ACTUAL MEDIA FILE ---
   useEffect(() => {
+    let objectUrl = null;
+    const controller = new AbortController();
     const fetchFile = async () => {
       try {
-        const res = await api.get(`/media/file/${result.media_item_id}/`, { 
-          responseType: 'blob' 
-        });
-        const url = URL.createObjectURL(res.data);
-        setFileUrl(url);
+        if (result.media_type === 'AUDIO') {
+          const res = await api.get(`/media/file/${result.media_item_id}/playback-link/`,
+            { signal: controller.signal });
+          if (!controller.signal.aborted) setFileUrl(res.data.url);
+          return;
+        }
+        const res = await api.get(`/media/file/${result.media_item_id}/`,
+          { responseType: 'blob', signal: controller.signal });
+        if (!controller.signal.aborted) {
+          objectUrl = URL.createObjectURL(res.data);
+          setFileUrl(objectUrl);
+        }
       } catch (err) {
-        console.error("Failed to load file", err);
+        if (!controller.signal.aborted) console.error("Failed to load file", err);
       } finally {
-        setLoading(false);
+        if (!controller.signal.aborted) setLoading(false);
       }
     };
 
+    setLoading(true);
+    setFileUrl(null);
     fetchFile();
-    return () => fileUrl && URL.revokeObjectURL(fileUrl);
-  }, [result.media_item_id]);
+    return () => {
+      controller.abort();
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    };
+  }, [result.media_item_id, result.media_type]);
 
   // --- 2. FETCH AI DESCRIPTION FROM MONGODB (via embedding info endpoint) ---
   // We call the existing /media/info/ endpoint which returns ai_description
@@ -60,7 +74,7 @@ const SearchResultModal = ({ result, onClose, onFindSimilar }) => {
 
   // --- 3. THE AUTO-SEEK ENGINE ---
   const handleLoadedMetadata = () => {
-    if (mediaRef.current && result.matched_segment_start_time) {
+    if (mediaRef.current && result.matched_segment_start_time != null) {
       mediaRef.current.currentTime = result.matched_segment_start_time;
     }
   };
@@ -103,6 +117,8 @@ const SearchResultModal = ({ result, onClose, onFindSimilar }) => {
       >
         
         {/* HEADER */}
+        {result.indexing_coverage?.stale && <p role="status" className="px-8 py-3 bg-amber-50 text-amber-800 text-sm">This file has changed. Search evidence is from its previous indexed version; opening the file shows the current contents.</p>}
+        {result.indexing_coverage?.partial && result.media_type === 'AUDIO' && <p role="status" className="px-8 py-3 bg-amber-50 text-amber-800 text-sm">Only part of this recording was transcribed. Some intervals may be missing from search.</p>}
         <div className="p-8 border-b border-slate-100 flex items-center justify-between shrink-0">
           <div className="flex-1 min-w-0 pr-4">
             <div className="flex items-center gap-3 mb-2">
@@ -166,11 +182,9 @@ const SearchResultModal = ({ result, onClose, onFindSimilar }) => {
                       className="w-full"
                       onLoadedMetadata={handleLoadedMetadata}
                     >
-                      <source src={fileUrl} type="audio/mpeg" />
+                      <source src={fileUrl} type={result.mime_type || 'audio/mpeg'} />
                     </audio>
-                    <p className="text-[10px] font-black uppercase tracking-[0.3em] text-indigo-400">
-                      Deep sonic jump enabled
-                    </p>
+                    <p className="text-xs text-indigo-200">Playback starts near the matched speech when indexing has a timestamp.</p>
                   </div>
                 )}
 
@@ -272,15 +286,15 @@ const SearchResultModal = ({ result, onClose, onFindSimilar }) => {
             </div>
           )}
 
-          {/* ── INTELLIGENCE SNIPPET (Documents only) ── */}
-          {result.media_type === 'DOCUMENT' && result.matched_chunk_preview && (
+          {/* ── MATCHED PASSAGE ── */}
+          {['DOCUMENT', 'AUDIO'].includes(result.media_type) && result.matched_chunk_preview && (
             <div className="space-y-4">
               <div className="flex items-center gap-3">
                 <div className="p-2 bg-indigo-50 rounded-xl">
                   <Sparkles className="w-4 h-4 text-indigo-500" />
                 </div>
                 <h3 className="text-sm font-black text-slate-800 uppercase tracking-widest">
-                  Matching Intelligence
+                  {result.media_type === 'AUDIO' ? 'Matched transcript' : 'Matching passage'}
                 </h3>
               </div>
               <div className="bg-slate-50 p-8 rounded-[28px] border-l-8 border-indigo-500 shadow-inner">
@@ -293,14 +307,14 @@ const SearchResultModal = ({ result, onClose, onFindSimilar }) => {
 
           {/* ── MULTIMEDIA TIMESTAMP JUMP (Video / Audio) ── */}
           {(result.media_type === 'VIDEO' || result.media_type === 'AUDIO') && 
-           result.matched_segment_start_time !== undefined && (
+           result.matched_segment_start_time != null && (
             <div className="bg-slate-900 rounded-[28px] p-7 text-white flex items-center justify-between">
               <div>
                 <h4 className="text-[10px] font-black uppercase tracking-widest text-slate-500 mb-1">
                   Target Moment
                 </h4>
                 <p className="text-lg font-black">
-                  Segment {Math.floor(result.matched_segment_start_time / 120) + 1}
+                  Start playback near the match
                 </p>
               </div>
               <div className="bg-indigo-500 text-white px-6 py-3 rounded-2xl flex items-center gap-3 font-black text-sm">

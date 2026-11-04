@@ -3,13 +3,16 @@ import hashlib
 import mimetypes
 import os
 import re
+import json
 import time
 from pathlib import Path
+from urllib.parse import quote
 from uuid import uuid4, uuid5, NAMESPACE_URL
 
 from django.conf import settings
+from django.core import signing
 from django.db import transaction
-from django.http import FileResponse, HttpResponse
+from django.http import FileResponse, HttpResponse, StreamingHttpResponse
 from rest_framework.decorators import api_view, parser_classes
 from rest_framework.parsers import MultiPartParser, FormParser
 from rest_framework.response import Response
@@ -18,11 +21,85 @@ from .auth_service import create_token, hash_password, token_required, verify_pa
 from .catalog_store import SQLiteCatalog, SQLiteJobScheduler
 from .contracts import SEARCH_SCHEMA_VERSION, SearchRequest, SearchValidationError
 from .local_retrieval import SQLiteExactVectors, SQLiteFullText
-from .models import CatalogAccount, CatalogCollection, CatalogFile, CatalogJob, CatalogUsage, CatalogVectorRecord, ProviderQuota
+from .models import CatalogAccount, CatalogCollection, CatalogFile, CatalogJob, CatalogUsage, CatalogVectorRecord, CatalogSource, ProviderQuota
 from .utils import validate_file
 
 catalog = SQLiteCatalog()
 scheduler = SQLiteJobScheduler()
+
+
+def source_document(source):
+    return {"id": source.id, "root_path": source.root_path, "kind": source.kind,
+            "state": source.state, "paused": source.paused, "error": source.error,
+            "collection_id": source.collection_id, "recursive": source.recursive,
+            "exclusions": source.exclusions, "settle_seconds": source.settle_seconds,
+            "scan_interval_seconds": source.scan_interval_seconds,
+            "last_scan_at": source.last_scan_at.isoformat() if source.last_scan_at else None}
+
+
+@api_view(["GET", "POST"])
+@token_required
+def sources(request):
+    if request.method == "GET":
+        return Response([source_document(source) for source in CatalogSource.objects.filter(user_id=request.user_id)])
+    if not isinstance(request.data, dict):
+        return Response({"error": "Source settings must be a JSON object"}, status=400)
+    from .source_sync import register_source
+    try:
+        root = request.data.get("root_path")
+        if not isinstance(root, str) or not root.strip():
+            raise ValueError("root_path is required")
+        source = register_source(request.user_id, root,
+            collection_id=request.data.get("collection_id"), exclusions=request.data.get("exclusions", []),
+            recursive=request.data.get("recursive", True))
+    except (ValueError, OSError) as error:
+        return Response({"error": str(error)}, status=400)
+    return Response(source_document(source), status=201)
+
+
+@api_view(["PATCH", "POST"])
+@token_required
+def source_settings(request, source_id):
+    if not isinstance(request.data, dict):
+        return Response({"error": "Source settings must be a JSON object"}, status=400)
+    source = CatalogSource.objects.filter(id=source_id, user_id=request.user_id, kind="linked_folder").first()
+    if source is None:
+        return Response({"error": "Source not found"}, status=404)
+    from django.utils import timezone
+    action = request.data.get("action")
+    if action is not None and action not in ("pause", "resume", "scan"):
+        return Response({"error": "action must be pause, resume, or scan"}, status=400)
+    for key, minimum, maximum in (("settle_seconds", 1, 60), ("scan_interval_seconds", 1, 3600)):
+        if key in request.data:
+            value = request.data[key]
+            if isinstance(value, bool) or not isinstance(value, int) or not minimum <= value <= maximum:
+                return Response({"error": f"{key} must be an integer from {minimum} to {maximum}"}, status=400)
+            setattr(source, key, value)
+    if "recursive" in request.data:
+        if not isinstance(request.data["recursive"], bool):
+            return Response({"error": "recursive must be a boolean"}, status=400)
+        source.recursive = request.data["recursive"]
+    if "collection_id" in request.data:
+        collection_id = request.data["collection_id"]
+        if collection_id is not None and (not isinstance(collection_id, str) or
+                not CatalogCollection.objects.filter(id=collection_id, user_id=request.user_id).exists()):
+            return Response({"error": "Collection not found or access denied"}, status=400)
+        source.collection_id = collection_id
+    if "exclusions" in request.data:
+        values = request.data["exclusions"]
+        if not isinstance(values, list) or len(values) > 100 or not all(isinstance(v, str) and 0 < len(v) <= 255 for v in values):
+            return Response({"error": "Invalid exclusion patterns"}, status=400)
+        source.exclusions = values
+    if action == "pause":
+        source.paused, source.state = True, "paused"
+    elif action == "resume":
+        source.paused, source.state = False, "active"
+        CatalogJob.objects.filter(file_version__file__source=source, state="paused",
+                                  error_category="source_paused").update(state="queued", error_category="", attempts=0)
+    source.next_scan_at = timezone.now()
+    source.save(update_fields=["settle_seconds", "scan_interval_seconds", "recursive", "exclusions",
+                               "paused", "state", "next_scan_at", "collection"])
+    return Response(source_document(source))
 
 
 def file_document(file):
@@ -115,10 +192,18 @@ def upload_media(request):
     folder.mkdir(parents=True, exist_ok=True)
     path = folder / f"{file_id}{Path(upload.name).suffix.lower()}"
     digest = hashlib.sha256()
-    with path.open("wb") as handle:
-        for chunk in upload.chunks():
-            handle.write(chunk)
-            digest.update(chunk)
+    temporary = path.with_suffix(path.suffix + ".importing")
+    try:
+        with temporary.open("wb") as handle:
+            for chunk in upload.chunks():
+                handle.write(chunk)
+                digest.update(chunk)
+            handle.flush()
+            os.fsync(handle.fileno())
+        temporary.replace(path)
+    except OSError:
+        temporary.unlink(missing_ok=True)
+        return Response({"error": "Could not copy the imported file"}, status=503)
     source_id = str(uuid5(NAMESPACE_URL, f"managed:{request.user_id}:{root}"))
     catalog.put_source(source_id=source_id, user_id=request.user_id,
                        kind="managed_import", root_path=str(root))
@@ -143,9 +228,11 @@ def list_collection_media(request, collection_id):
 @token_required
 def serve_media_file(request, media_id):
     file = catalog.get_file(media_id, request.user_id)
-    if file is None:
+    if file is None or not file.available:
         return HttpResponse(status=404)
     thumbnail = request.GET.get("thumbnail") == "true"
+    if thumbnail and not file.thumbnail_path:
+        return HttpResponse(status=404)
     path = Path(file.thumbnail_path if thumbnail and file.thumbnail_path else file.path)
     if thumbnail and file.source_type not in ("IMAGE", "VIDEO", "DOCUMENT"):
         return HttpResponse(status=404)
@@ -157,9 +244,91 @@ def serve_media_file(request, media_id):
     if not path.resolve().is_relative_to(allowed_root):
         return HttpResponse(status=404)
     if thumbnail and file.source_type == "IMAGE" and file.thumbnail_path and not path.resolve().is_relative_to(
-            (Path(settings.MEDIA_VAULT) / "derivatives" / file.id / str(file.current_version_id)).resolve()):
+            (Path(settings.MEDIA_VAULT) / "derivatives" / file.id / str(file.published_version_id or file.current_version_id)).resolve()):
         return HttpResponse(status=404)
-    return FileResponse(path.open("rb"), content_type="image/jpeg" if thumbnail and file.thumbnail_path else file.mime_type)
+    try:
+        handle = path.open("rb")
+    except PermissionError:
+        return HttpResponse(status=423)
+    except OSError:
+        return HttpResponse(status=404)
+    return FileResponse(handle, content_type="image/jpeg" if thumbnail and file.thumbnail_path else file.mime_type)
+
+
+@api_view(["GET"])
+@token_required
+def audio_playback_link(request, media_id):
+    file = catalog.get_file(media_id, request.user_id)
+    if file is None or not file.available or file.source_type != "AUDIO":
+        return Response({"error": "Audio file is unavailable"}, status=404)
+    token = signing.dumps({"file_id": file.id, "user_id": request.user_id},
+                          salt="semantic-gallery-audio-playback")
+    path = f"/api/media/file/{file.id}/stream/?token={quote(token)}"
+    return Response({"url": request.build_absolute_uri(path)})
+
+
+def stream_audio(request, media_id):
+    try:
+        identity = signing.loads(request.GET.get("token", ""),
+            salt="semantic-gallery-audio-playback", max_age=3600)
+    except (signing.BadSignature, signing.SignatureExpired):
+        return HttpResponse(status=403)
+    if identity.get("file_id") != media_id:
+        return HttpResponse(status=403)
+    file = catalog.get_file(media_id, identity.get("user_id", ""))
+    if file is None or not file.available or file.source_type != "AUDIO":
+        return HttpResponse(status=404)
+    path = Path(file.path)
+    root = Path(settings.MEDIA_VAULT if file.source.kind == "managed_import" else file.source.root_path)
+    if not path.is_file() or not path.resolve().is_relative_to(root.resolve()):
+        return HttpResponse(status=404)
+    try:
+        size = path.stat().st_size
+        header = request.headers.get("Range", "")
+        start, end = 0, size - 1
+        if header:
+            import re as _re
+            match = _re.fullmatch(r"bytes=(\d*)-(\d*)", header.strip())
+            if not match or (not match.group(1) and not match.group(2)):
+                response = HttpResponse(status=416)
+                response["Content-Range"] = f"bytes */{size}"
+                return response
+            if not match.group(1):
+                start = max(0, size - int(match.group(2)))
+            else:
+                start = int(match.group(1))
+                end = min(size - 1, int(match.group(2))) if match.group(2) else size - 1
+            if start >= size or end < start:
+                response = HttpResponse(status=416)
+                response["Content-Range"] = f"bytes */{size}"
+                return response
+        handle = path.open("rb")
+        handle.seek(start)
+    except PermissionError:
+        return HttpResponse(status=423)
+    except OSError:
+        return HttpResponse(status=404)
+
+    def blocks():
+        try:
+            remaining = end - start + 1
+            while remaining:
+                data = handle.read(min(1024 * 1024, remaining))
+                if not data:
+                    break
+                remaining -= len(data)
+                yield data
+        finally:
+            handle.close()
+
+    response = StreamingHttpResponse(blocks(), status=206 if header else 200,
+                                     content_type=file.mime_type or "application/octet-stream")
+    response["Content-Length"] = str(end - start + 1)
+    response["Accept-Ranges"] = "bytes"
+    response["Cache-Control"] = "private, no-store"
+    if header:
+        response["Content-Range"] = f"bytes {start}-{end}/{size}"
+    return response
 
 
 @api_view(["DELETE"])
@@ -222,7 +391,7 @@ def retry_embedding(request, media_id):
     elif job and job.state == "paused":
         scheduler.control(job.id, request.user_id, "resume")
     elif not job or job.state == "done":
-        scheduler.enqueue(file.current_version_id, "discover")
+        catalog.queue_reindex(file.id, request.user_id)
     file.processing_status = "PENDING"
     file.save(update_fields=["processing_status"])
     return Response({"message": "Retry queued."})
@@ -291,7 +460,42 @@ def search_media(request):
         return Response({"error": str(error), "code": "INVALID_SEARCH_REQUEST", "schema_version": SEARCH_SCHEMA_VERSION}, status=400)
     if search.collection_id and not CatalogCollection.objects.filter(id=search.collection_id, user_id=request.user_id).exists():
         return Response({"error": "Collection not found or access denied", "code": "COLLECTION_NOT_FOUND"}, status=404)
-    from .retrieval_pipeline import filename_hits, fuse, relevant, resolve_constraints
+    mode = request.data.get("mode", "semantic")
+    if mode not in ("local", "semantic"):
+        return Response({"error": "mode must be local or semantic", "code": "INVALID_SEARCH_REQUEST"}, status=400)
+    from . import search_cache
+    from .desktop_embedding import (ACTIVE_INDEX_GENERATION, DIMENSIONS, INDEX_GENERATION,
+                                    MODEL_CONFIG, PREVIOUS_MODEL_CONFIG, QUERY_CACHE_HIT, PROVIDER_CALLS)
+    QUERY_CACHE_HIT.set(False)
+    PROVIDER_CALLS.set(0)
+    from django.utils import timezone
+    indexing_active = (CatalogJob.objects.filter(state="running", lease_until__gt=timezone.now()).exists()
+                       if request.data.get("measure_load") is True else None)
+    from .retrieval_pipeline import filename_hits, fuse, resolve_constraints
+    from .ranking_policy import (accept_features, features_from_entry, load_policy,
+                                 score_features)
+    active_config = MODEL_CONFIG if ACTIVE_INDEX_GENERATION == INDEX_GENERATION else PREVIOUS_MODEL_CONFIG
+    try:
+        policy = load_policy()
+        if (policy.get("index_generation") not in (None, ACTIVE_INDEX_GENERATION) or
+                policy.get("index_config") not in (None, active_config)):
+            raise ValueError("Ranking policy was calibrated for a different index configuration")
+    except (OSError, ValueError) as error:
+        return Response({"error": str(error), "code": "RANK_POLICY_INVALID"}, status=503)
+    catalog_revision = search_cache.revision()
+    cache_key = (request.user_id, search.query, search.file_type, request.data.get("file_type"),
+                 search.collection_id, search.limit, mode, ACTIVE_INDEX_GENERATION, active_config,
+                 json.dumps(policy, sort_keys=True), catalog_revision)
+    debug = request.data.get("debug_candidates") is True
+    cached = None if debug else search_cache.get(cache_key)
+    if cached is not None:
+        paths = CatalogFile.objects.filter(id__in=[row["file_id"] for row in cached["results"]],
+                                           user_id=request.user_id).values_list("path", flat=True)
+        if all(Path(path).is_file() for path in paths):
+            cached["search_time_ms"] = round((time.perf_counter() - started) * 1000, 2)
+            cached["metrics"] = {"api_wall_ms": cached["search_time_ms"], "result_cache_hit": True,
+                                 "embedding_provider_calls": 0, "indexing_active": indexing_active}
+            return Response(cached)
     source_type, lexical_query = resolve_constraints(search, request.data)
     mime_type = ("application/pdf" if request.data.get("file_type") is None and
                  source_type == "DOCUMENT" and
@@ -305,9 +509,8 @@ def search_media(request):
     semantic_groups = {}
     from .models import CatalogSegment
     try:
-        from .desktop_embedding import (ACTIVE_INDEX_GENERATION, DIMENSIONS, INDEX_GENERATION,
-                                        MODEL_CONFIG, PREVIOUS_MODEL_CONFIG)
-        active_config = MODEL_CONFIG if ACTIVE_INDEX_GENERATION == INDEX_GENERATION else PREVIOUS_MODEL_CONFIG
+        if mode == "local":
+            raise LookupError("Local suggestions do not call the provider")
         local_available = CatalogVectorRecord.objects.filter(backend="sqlite_exact",
             model_config=active_config, index_generation=ACTIVE_INDEX_GENERATION).exists()
         if not local_available:
@@ -327,8 +530,19 @@ def search_media(request):
         provider_error = error
     retrieved_at = time.perf_counter()
     candidates = fuse(keyword_hits, semantic_groups, names)
-    ranked = [(file_id, entry) for file_id, entry in candidates.items() if relevant(entry)]
-    ranked.sort(key=lambda pair: pair[1]["rank_score"], reverse=True)
+    candidate_files = CatalogFile.objects.filter(id__in=candidates, user_id=request.user_id).select_related("current_version", "published_version").in_bulk()
+    for file_id, entry in candidates.items():
+        candidate = candidate_files.get(file_id)
+        entry["features"] = features_from_entry(entry,
+            filename=candidate.original_name if candidate else "", query=lexical_query,
+            constraints_ok=bool(candidate and (not source_type or candidate.source_type == source_type)
+                                and (not mime_type or candidate.mime_type == mime_type)))
+        entry["rank_score"] = score_features(entry["features"], policy)
+    ranked = [(file_id, entry) for file_id, entry in candidates.items()
+              if accept_features(entry["features"], policy)]
+    ranked.sort(key=lambda pair: (-pair[1]["rank_score"],
+                                  candidate_files[pair[0]].original_name.casefold()
+                                  if pair[0] in candidate_files else pair[0]))
     if provider_error and not ranked:
         from .provider_quota import QuotaError
         if isinstance(provider_error, QuotaError):
@@ -347,9 +561,8 @@ def search_media(request):
     candidate_debug = None
     if request.data.get("debug_candidates") is True:
         candidate_debug = []
-        for candidate_file_id, entry in sorted(candidates.items(),
-                                               key=lambda pair: pair[1]["rank_score"], reverse=True)[:100]:
-            candidate_file = catalog.get_file(candidate_file_id, request.user_id)
+        for candidate_file_id, entry in sorted(candidates.items(), key=lambda pair: pair[0])[:500]:
+            candidate_file = candidate_files.get(candidate_file_id)
             if candidate_file is None:
                 continue
             candidate_debug.append({"original_filename": candidate_file.original_name,
@@ -360,12 +573,14 @@ def search_media(request):
                 "keyword_coverage": (entry["channels"].get("keyword") or {}).get("matched_terms"),
                 "query_terms": (entry["channels"].get("keyword") or {}).get("query_terms"),
                 "filename_match": "filename" in entry["channels"],
-                "passed_policy": relevant(entry)})
+                "features": entry["features"],
+                "rank_score": entry["rank_score"],
+                "passed_policy": accept_features(entry["features"], policy)})
     evidence_ids = {item["segment_id"] for _, entry in ranked[:search.limit]
                     for item in entry["evidence"] if item.get("segment_id")}
     segments = CatalogSegment.objects.in_bulk(evidence_ids)
     for file_id, entry in ranked[:search.limit]:
-        file = catalog.get_file(file_id, request.user_id)
+        file = candidate_files.get(file_id)
         if file is None or not Path(file.path).is_file():
             continue
         supporting = []
@@ -389,7 +604,12 @@ def search_media(request):
                        key=lambda item: item["semantic_cosine"], default=None))
         if primary is None and "filename" not in entry["channels"]:
             primary = supporting[0] if supporting else None
-        row = file_document(file)
+        row = {"_id": file.id, "file_id": file.id, "media_type": file.source_type,
+               "source_type": file.source_type, "processing_status": file.processing_status,
+               "file_version": (file.published_version or file.current_version).fingerprint if file.current_version else None,
+               "created_at": file.created_at.isoformat(),
+               "file_metadata": {"original_name": file.original_name, "size_bytes": file.size_bytes,
+                                 "mime_type": file.mime_type}}
         row.update({"schema_version": SEARCH_SCHEMA_VERSION,
                     "media_item_id": file_id, "original_filename": file.original_name,
                     "file_size_bytes": file.size_bytes, "mime_type": file.mime_type,
@@ -399,7 +619,11 @@ def search_media(request):
                     "availability": "available" if file.available else "missing",
                     "indexing_coverage": {"status": file.processing_status,
                         "partial": file.processing_status == "PARTIAL",
-                        **(file.current_version.extraction_coverage if file.current_version else {})},
+                        "published_generation": file.published_version.generation if file.published_version else None,
+                        "pending_generation": file.current_version.generation if file.current_version else None,
+                        "stale": bool(file.published_version_id and (
+                            file.published_version_id != file.current_version_id or file.processing_status == "WAITING_FOR_FILE")),
+                        **((file.published_version or file.current_version).extraction_coverage if file.current_version else {})},
                     "representation": primary["representation"] if primary else "filename",
                     "evidence_source": primary["source"] if primary else "filename",
                     "matched_chunk_preview": primary["text_preview"] if primary else "",
@@ -408,12 +632,26 @@ def search_media(request):
         results.append(row)
     elapsed = round((time.perf_counter() - started) * 1000, 2)
     from .desktop_embedding import ACTIVE_INDEX_GENERATION
-    return Response({"schema_version": SEARCH_SCHEMA_VERSION,
+    payload = {"schema_version": SEARCH_SCHEMA_VERSION,
+                     "search_mode": mode, "semantic_status": "not_requested" if mode == "local" else
+                        "unavailable" if provider_error else "complete" if semantic_groups else "not_indexed",
                      "index_generation": ACTIVE_INDEX_GENERATION, "query": search.query,
+                     "index_config": active_config,
+                     "ranking_policy_version": policy["schema_version"],
                      "effective_file_type": source_type, "match_decision": "results" if results else "no_match",
                      "results": results, "total_count": len(results), "search_time_ms": elapsed,
-                     **({"candidate_debug": candidate_debug} if candidate_debug is not None else {}),
+                     **({"candidate_debug": candidate_debug,
+                         "candidate_pool_count": len(candidates),
+                         "candidate_debug_truncated": len(candidates) > 500}
+                        if candidate_debug is not None else {}),
                      "metrics": {"api_wall_ms": elapsed,
                                  "parse_ms": round((parsed_at - started) * 1000, 2),
                                  "keyword_ms": round((keywords_at - parsed_at) * 1000, 2),
-                                 "semantic_ms": round((retrieved_at - keywords_at) * 1000, 2)}})
+                                 "semantic_ms": round((retrieved_at - keywords_at) * 1000, 2),
+                                 "embedding_provider_calls": PROVIDER_CALLS.get(),
+                                 "query_embedding_cache_hit": QUERY_CACHE_HIT.get(),
+                                 "indexing_active": indexing_active,
+                                 "result_cache_hit": False}}
+    if not debug and provider_error is None and search_cache.revision() == catalog_revision:
+        search_cache.put(cache_key, payload)
+    return Response(payload)

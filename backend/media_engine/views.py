@@ -10,6 +10,7 @@ from django.conf import settings
 import os
 import time
 import hashlib
+import re
 import uuid
 from datetime import datetime
 from .database import db
@@ -440,6 +441,24 @@ def search_media(request):
     limit = search_request.limit
     if collection_id and not db.collections.find_one({"_id": collection_id, "user_id": request.user_id}, {"_id": 1}):
         return Response({"error": "Collection not found or access denied", "code": "COLLECTION_NOT_FOUND", "schema_version": SEARCH_SCHEMA_VERSION}, status=404)
+
+    mode = request.data.get("mode", "semantic")
+    if mode not in ("local", "semantic"):
+        return Response({"error": "mode must be local or semantic"}, status=400)
+    if mode == "local":
+        filters = {"user_id": request.user_id,
+                   "file_metadata.original_name": {"$regex": re.escape(query_text), "$options": "i"}}
+        if collection_id:
+            filters["collection_id"] = collection_id
+        if file_type:
+            filters["media_type"] = file_type
+        items = db.media_items.find(filters, {"_id": 1, "media_type": 1, "file_metadata": 1}).limit(limit)
+        rows = [{"file_id": str(item["_id"]), "media_item_id": str(item["_id"]),
+                 "original_filename": item.get("file_metadata", {}).get("original_name", ""),
+                 "media_type": item.get("media_type"), "similarity_percentage": None}
+                for item in items]
+        return Response({"results": rows, "total_count": len(rows), "search_mode": "local",
+                         "semantic_status": "not_requested", "search_time_ms": round((time.perf_counter() - request_started) * 1000, 2)})
 
     print(f"📡 [API] Search request from User {request.user_id}: '{query_text}'")
 

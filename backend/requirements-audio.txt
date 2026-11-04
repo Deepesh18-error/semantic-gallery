@@ -1,0 +1,2 @@
+# Optional local speech indexing. Install alongside requirements.txt on the worker machine.
+faster-whisper>=1.2,<2

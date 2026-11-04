@@ -3,6 +3,8 @@ import hashlib
 import math
 import logging
 import os
+import threading
+from contextvars import ContextVar
 from array import array
 from pathlib import Path
 
@@ -13,6 +15,22 @@ from .models import CatalogEmbeddingCache
 from .provider_quota import QuotaError, call_with_quota
 
 log = logging.getLogger(__name__)
+_clients = threading.local()
+QUERY_CACHE_HIT = ContextVar("query_embedding_cache_hit", default=False)
+PROVIDER_CALLS = ContextVar("embedding_provider_calls", default=0)
+
+
+def provider_client():
+    key = os.getenv("GOOGLE_API_KEY")
+    if not key:
+        raise QuotaError("credentials")
+    if getattr(_clients, "key", None) != key:
+        previous = getattr(_clients, "client", None)
+        if previous is not None:
+            previous.close()
+        _clients.client = genai.Client(api_key=key)
+        _clients.key = key
+    return _clients.client
 
 MODEL = os.getenv("GEMINI_EMBED_MODEL", "gemini-embedding-2")
 DIMENSIONS = 3072
@@ -61,8 +79,8 @@ def _cache_key(kind, payload):
     return digest.hexdigest()
 
 
-def _cached(user_id, digest):
-    row = CatalogEmbeddingCache.objects.filter(user_id=user_id, model_config=MODEL_CONFIG,
+def _cached(user_id, digest, model_config=MODEL_CONFIG):
+    row = CatalogEmbeddingCache.objects.filter(user_id=user_id, model_config=model_config,
                                                content_digest=digest).first()
     if row is None or row.dimensions != DIMENSIONS:
         return None
@@ -71,26 +89,29 @@ def _cached(user_id, digest):
     return _normalize(vector)
 
 
-def _save_cache(user_id, digest, values):
+def _save_cache(user_id, digest, values, model_config=MODEL_CONFIG):
     CatalogEmbeddingCache.objects.update_or_create(
-        user_id=user_id, model_config=MODEL_CONFIG, content_digest=digest,
+        user_id=user_id, model_config=model_config, content_digest=digest,
         defaults={"dimensions": DIMENSIONS, "vector_blob": array("f", values).tobytes()})
 
 
-def _embed_one(content, estimate, *, user_id, operation, digest, priority):
-    cached = _cached(user_id, digest)
+def _embed_one(content, estimate, *, user_id, operation, digest, priority, model_config=MODEL_CONFIG):
+    cached = _cached(user_id, digest, model_config)
     if cached is not None:
+        if operation == "query_embedding":
+            QUERY_CACHE_HIT.set(True)
         return cached
     if not os.getenv("GOOGLE_API_KEY"):
         raise QuotaError("credentials")
-    client = genai.Client(api_key=os.getenv("GOOGLE_API_KEY"))
+    client = provider_client()
     response = call_with_quota(MODEL, operation, estimate,
         lambda: client.models.embed_content(model=MODEL, contents=content,
             config=types.EmbedContentConfig(output_dimensionality=DIMENSIONS)),
-        user_id=user_id, priority=priority)
+        user_id=user_id, priority=priority,
+        on_send=lambda: PROVIDER_CALLS.set(PROVIDER_CALLS.get() + 1))
     vector = _single_embedding(response)
     try:
-        _save_cache(user_id, digest, vector)
+        _save_cache(user_id, digest, vector, model_config)
     except Exception:
         log.exception("Embedding cache write failed after successful provider call")
     return vector
@@ -120,14 +141,9 @@ def embed_segment(segment, user_id):
 def embed_query(text, user_id, *, generation=INDEX_GENERATION):
     content = f"task: search result | query: {text}"
     if generation == 1:
-        if not os.getenv("GOOGLE_API_KEY"):
-            raise QuotaError("credentials")
-        client = genai.Client(api_key=os.getenv("GOOGLE_API_KEY"))
-        response = call_with_quota(MODEL, "query_embedding", max(1, len(content) // 4),
-            lambda: client.models.embed_content(model=MODEL, contents=content,
-                config=types.EmbedContentConfig(output_dimensionality=DIMENSIONS)),
-            user_id=user_id, priority="interactive")
-        return _single_embedding(response)
+        return _embed_one(content, max(1, len(content) // 4), user_id=user_id,
+            operation="query_embedding", digest=_cache_key("search-query-v1", content.encode("utf-8")),
+            priority="interactive", model_config=PREVIOUS_MODEL_CONFIG)
     if generation != INDEX_GENERATION:
         raise ValueError("Unsupported index generation")
     digest = _cache_key("search-query-v2", content.encode("utf-8"))

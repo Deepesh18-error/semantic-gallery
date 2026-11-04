@@ -157,7 +157,13 @@ def extract(file):
                 thumbnail.thumbnail((320, 320))
                 thumbnail.save(derivative / "thumbnail.jpg", "JPEG", quality=78)
                 file.thumbnail_path = str(derivative / "thumbnail.jpg")
-                file.save(update_fields=["thumbnail_path"])
+                if hasattr(file, "_meta"):
+                    from .models import CatalogFileVersion
+                    CatalogFileVersion.objects.filter(pk=file.current_version_id).update(thumbnail_path=file.thumbnail_path)
+                    if not file.published_version_id:
+                        file.save(update_fields=["thumbnail_path"])
+                else:
+                    file.save(update_fields=["thumbnail_path"])
                 visual_image = image.copy()
                 visual_image.thumbnail((1024, 1024))
                 visual = derivative / "visual.jpg"
@@ -183,7 +189,10 @@ def extract(file):
                 return segments
         except Exception as error:
             raise ExtractionError("extraction_failed", str(error)) from error
-    if file.source_type in ("VIDEO", "AUDIO"):
+    if file.source_type == "AUDIO":
+        from .audio_transcription import extract_audio
+        return extract_audio(file)
+    if file.source_type == "VIDEO":
         raw = _run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
                     "-of", "default=noprint_wrappers=1:nokey=1", str(path)])
         try:
@@ -200,11 +209,10 @@ def extract(file):
         while start < duration:
             end = min(start + target_seconds, duration)
             ordinal = len(segments)
-            output = derivative / (f"segment-{ordinal}.mp4" if file.source_type == "VIDEO" else f"segment-{ordinal}.mp3")
+            output = derivative / f"segment-{ordinal}.mp4"
             command = ["ffmpeg", "-v", "error", "-y", "-ss", str(start), "-i", str(path),
                        "-t", str(end - start)]
-            command += (["-c:v", "libx264", "-b:v", "600k", "-c:a", "aac", "-b:a", "96k"]
-                        if file.source_type == "VIDEO" else ["-vn", "-c:a", "libmp3lame", "-b:a", "64k"])
+            command += ["-c:v", "libx264", "-b:v", "600k", "-c:a", "aac", "-b:a", "96k"]
             _run(command + [str(output)])
             if not output.is_file() or not output.stat().st_size:
                 raise ExtractionError("extraction_failed", "Empty media segment")

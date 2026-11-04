@@ -25,6 +25,8 @@ const Search = () => {
   const [searchParams] = useSearchParams();
   const [query, setQuery] = useState(searchParams.get('q') || '');
   const [activeFilter, setActiveFilter] = useState('ALL');
+  const [filterExplicit, setFilterExplicit] = useState(false);
+  const [searchPhase, setSearchPhase] = useState('idle');
   const [scopedCollectionId] = useState(searchParams.get('collectionId') || null);    
   const [results, setResults] = useState([]);
   const [loading, setLoading] = useState(false);
@@ -34,9 +36,14 @@ const Search = () => {
   
   const debounceTimer = useRef(null);
   const searchStartedAt = useRef(null);
+  const activeRequest = useRef(null);
+  const requestSequence = useRef(0);
 
   // --- 1. THE SEARCH CORE ---
-  const performSearch = useCallback(async (searchQuery, filter) => {
+  const performSearch = useCallback(async (searchQuery, filter, mode = 'semantic') => {
+    clearTimeout(debounceTimer.current);
+    activeRequest.current?.abort();
+    const sequence = ++requestSequence.current;
     if (!searchQuery.trim()) {
       setResults([]);
       setSearchStats(null);
@@ -44,31 +51,42 @@ const Search = () => {
     }
 
     setLoading(true);
-    searchStartedAt.current = performance.now();
+    setSearchPhase(mode === 'local' ? 'local' : 'semantic');
+    const controller = new AbortController();
+    activeRequest.current = controller;
+    const started = performance.now();
+    searchStartedAt.current = started;
     try {
       const response = await api.post('/search/', {
         query: searchQuery,
-        file_type: filter === 'ALL' ? null : filter,
+        file_type: filter === 'ALL' && !filterExplicit ? null : filter,
         collection_id: scopedCollectionId,
-        limit: 20
-      });
+        limit: mode === 'local' ? 8 : 20,
+        mode
+      }, { signal: controller.signal });
+      if (sequence !== requestSequence.current) return;
       
       setResults(response.data.results);
       setSearchStats({
         count: response.data.total_count,
         time: response.data.search_time_ms
       });
+      setSearchPhase(mode === 'local' ? 'suggestions' : response.data.semantic_status || 'complete');
       console.info('[SEARCH_UI_METRICS]', JSON.stringify({
         query: searchQuery,
-        request_round_trip_ms: Math.round(performance.now() - searchStartedAt.current),
+        request_round_trip_ms: Math.round(performance.now() - started),
+        mode,
         server: response.data.metrics || null
       }));
     } catch (err) {
-      toast.error(explainApiError(err));
+      if (sequence === requestSequence.current && !controller.signal.aborted) {
+        setSearchPhase('error');
+        toast.error(explainApiError(err));
+      }
     } finally {
-      setLoading(false);
+      if (sequence === requestSequence.current) setLoading(false);
     }
-  }, []);
+  }, [scopedCollectionId, filterExplicit]);
 
   useEffect(() => {
     if (!loading && searchStartedAt.current !== null) {
@@ -85,13 +103,24 @@ const Search = () => {
 
   // --- 2. DEBOUNCE LOGIC (300ms) ---
   useEffect(() => {
-    if (debounceTimer.current) clearTimeout(debounceTimer.current);
+    activeRequest.current?.abort();
+    ++requestSequence.current;
+    clearTimeout(debounceTimer.current);
+    setLoading(false);
+    setResults([]);
+    setSearchStats(null);
+    setSearchPhase('idle');
+    searchStartedAt.current = null;
 
     debounceTimer.current = setTimeout(() => {
-      performSearch(query, activeFilter);
-    }, 300);
+      performSearch(query, activeFilter, 'local');
+    }, 150);
 
-    return () => clearTimeout(debounceTimer.current);
+    return () => {
+      clearTimeout(debounceTimer.current);
+      activeRequest.current?.abort();
+      ++requestSequence.current;
+    };
   }, [query, activeFilter, performSearch]);
 
   // --- 3. VOICE SEARCH (Web Speech API) ---
@@ -146,6 +175,12 @@ const Search = () => {
               type="text"
               value={query}
               onChange={(e) => setQuery(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' && !e.nativeEvent.isComposing) {
+                  e.preventDefault();
+                  performSearch(query, activeFilter, 'semantic');
+                }
+              }}
               placeholder="Search images, videos, audio or documents in plain English..."
               className="w-full pl-16 pr-20 py-6 bg-slate-50 border-2 border-transparent rounded-[32px] outline-none text-lg font-bold text-slate-800 placeholder:text-slate-400 focus:bg-white focus:border-brand focus:shadow-2xl focus:shadow-brand/10 transition-all"
             />
@@ -163,7 +198,7 @@ const Search = () => {
             {FILTERS.map((f) => (
               <button
                 key={f.id}
-                onClick={() => setActiveFilter(f.id)}
+                onClick={() => { setFilterExplicit(true); setActiveFilter(f.id); }}
                 className={`flex items-center gap-2 px-6 py-2.5 rounded-full text-xs font-black uppercase tracking-widest border-2 transition-all whitespace-nowrap cursor-pointer ${activeFilter === f.id ? 'bg-slate-900 border-slate-900 text-white shadow-lg' : 'bg-white border-slate-100 text-slate-400 hover:border-slate-300'}`}
               >
                 <f.icon className="w-3.5 h-3.5" />
@@ -171,6 +206,13 @@ const Search = () => {
               </button>
             ))}
           </div>
+          <p className="text-xs text-slate-500" role="status" aria-live="polite">
+            {searchPhase === 'semantic' ? 'Searching file contents and visual evidence…' :
+             searchPhase === 'complete' ? 'Semantic search complete.' :
+             searchPhase === 'unavailable' ? 'Showing local matches. Semantic search is unavailable.' :
+             searchPhase === 'not_indexed' ? 'Showing local matches. Semantic indexing is not ready.' :
+             'Local suggestions while you type. Press Enter to search contents and images.'}
+          </p>
         </div>
       </header>
 
